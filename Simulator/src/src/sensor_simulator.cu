@@ -102,7 +102,24 @@ namespace raycast
         return 0;        
     }
 
-    __global__ void cameraRaycastKernel(float* depth_values, GridMap grid_map, CameraParams camera_param, cudaMat::SE3<float> T_wc)
+    // REACT stage-2 [🟧 D-3]: ray-sphere intersection in camera frame.
+    // Inputs are all in camera frame (ray origin = (0,0,0), `d` is unit
+    // ray direction, `c_cam` is sphere center transformed into camera frame).
+    // Returns the camera-frame x of the near hit, or INFINITY if no hit
+    // (matching the depth semantic used by the static path: depth = hit_pt.x).
+    __device__ float ray_sphere_depth(float3 d_unit, float3 c_cam, float r)
+    {
+        float b = d_unit.x * c_cam.x + d_unit.y * c_cam.y + d_unit.z * c_cam.z;
+        float c2 = c_cam.x * c_cam.x + c_cam.y * c_cam.y + c_cam.z * c_cam.z;
+        float disc = b * b - (c2 - r * r);
+        if (disc < 0.0f) return INFINITY;
+        float t = b - sqrtf(disc);   // near hit; +X is forward
+        if (t <= 0.0f) return INFINITY;
+        return t * d_unit.x;          // depth = cam-frame x of hit point
+    }
+
+    __global__ void cameraRaycastKernel(float* depth_values, GridMap grid_map, CameraParams camera_param, cudaMat::SE3<float> T_wc,
+                                        DynSphere* d_dyn, int n_dyn)
     {
         int u = threadIdx.x;
         int v = blockIdx.x;
@@ -164,6 +181,21 @@ namespace raycast
                 }
             }
 
+            // REACT stage-2 [🟧 D-3]: intersect ray against each dynamic sphere
+            // and keep the nearest. n_dyn == 0 (default) makes this a no-op so
+            // pre-existing callers get bit-identical output.
+            if (n_dyn > 0)
+            {
+                float3 d_unit = make_float3(x, y, z);
+                for (int i = 0; i < n_dyn; ++i)
+                {
+                    float3 c_cam = T_wc.inv() * d_dyn[i].pos;
+                    float depth_s = ray_sphere_depth(d_unit, c_cam, d_dyn[i].radius);
+                    if (depth_s < depth) depth = depth_s;
+                }
+                if (depth > camera_param.max_depth_dist) depth = camera_param.max_depth_dist;
+            }
+
             // 将深度值存储到输出数组中
             if (camera_param.normalize_depth)
                 depth = depth / camera_param.max_depth_dist;
@@ -171,23 +203,54 @@ namespace raycast
         }
     }
 
-    void renderDepthImage(GridMap* grid_map, CameraParams* camera_param, cudaMat::SE3<float>& T_wc, cv::Mat& depth_image)
-    {   
+    void renderDepthImage(GridMap* grid_map, CameraParams* camera_param, cudaMat::SE3<float>& T_wc, cv::Mat& depth_image,
+                          DynSphere* d_dyn, int n_dyn)
+    {
         float* depth_values;
         size_t num_elements = camera_param->image_width * camera_param->image_height;
         cudaMallocManaged(&depth_values, num_elements * sizeof(float));
 
         // 在GPU上启动核函数
-        cameraRaycastKernel<<<camera_param->image_height, camera_param->image_width>>>(depth_values, *grid_map, *camera_param, T_wc);
-        
+        cameraRaycastKernel<<<camera_param->image_height, camera_param->image_width>>>(depth_values, *grid_map, *camera_param, T_wc,
+                                                                                       d_dyn, n_dyn);
+
         cudaDeviceSynchronize();
 
         depth_image.create(camera_param->image_height, camera_param->image_width, CV_32FC1);
 
         cudaMemcpy(depth_image.data, depth_values, num_elements * sizeof(float), cudaMemcpyDeviceToHost);
-        
+
         cudaFree(depth_values);
         return;
+    }
+
+    // REACT stage-2 [🟧 D-3] host-side helpers for managing the per-frame
+    // dynamic-sphere GPU buffer. Reallocates only when the sphere count
+    // changes; otherwise it just memcpy's the new positions.
+    void uploadDynamicSpheres(DynSphere** d_dyn, int* n_dyn, const std::vector<DynSphere>& host_spheres)
+    {
+        int new_n = (int)host_spheres.size();
+        if (new_n != *n_dyn)
+        {
+            if (*d_dyn != nullptr) cudaFree(*d_dyn);
+            if (new_n > 0)
+                cudaMalloc((void**)d_dyn, new_n * sizeof(DynSphere));
+            else
+                *d_dyn = nullptr;
+            *n_dyn = new_n;
+        }
+        if (new_n > 0)
+            cudaMemcpy(*d_dyn, host_spheres.data(), new_n * sizeof(DynSphere), cudaMemcpyHostToDevice);
+    }
+
+    void freeDynamicSpheres(DynSphere** d_dyn, int* n_dyn)
+    {
+        if (*d_dyn != nullptr)
+        {
+            cudaFree(*d_dyn);
+            *d_dyn = nullptr;
+        }
+        *n_dyn = 0;
     }
 
     __global__ void lidarRaycastKernel(Vector3f* point_values, GridMap grid_map, LidarParams lidar_param, cudaMat::SE3<float> T_wc)

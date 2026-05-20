@@ -52,6 +52,14 @@ namespace raycast
         float max_lidar_dist{50};
     };
 
+    // REACT stage-2 [🟧 D-3]: per-frame dynamic sphere injected into the
+    // existing static raycaster. `pos` is in world frame, `radius` in meters.
+    struct DynSphere
+    {
+        float3 pos;
+        float  radius;
+    };
+
     class GridMap
     {
         public:
@@ -75,10 +83,19 @@ namespace raycast
             int occupy_threshold_;                                        // occupancy threshold
     };
 
-    __global__ void cameraRaycastKernel(float *depth_values, GridMap grid_map, CameraParams camera_param, cudaMat::SE3<float> T_wc);
+    __global__ void cameraRaycastKernel(float *depth_values, GridMap grid_map, CameraParams camera_param, cudaMat::SE3<float> T_wc,
+                                        DynSphere *d_dyn, int n_dyn);
     __global__ void lidarRaycastKernel(Vector3f* point_values, GridMap grid_map, LidarParams lidar_param, cudaMat::SE3<float> T_wc);
 
-    void renderDepthImage(GridMap *grid_map, CameraParams *camera_param, cudaMat::SE3<float>& T_wc, cv::Mat &depth_image);
+    // n_dyn = 0 (default) reproduces the original static raycast exactly.
+    void renderDepthImage(GridMap *grid_map, CameraParams *camera_param, cudaMat::SE3<float>& T_wc, cv::Mat &depth_image,
+                          DynSphere *d_dyn = nullptr, int n_dyn = 0);
     void renderLidarPointcloud(GridMap *grid_map, LidarParams *lidar_param, cudaMat::SE3<float>& T_wc, pcl::PointCloud<pcl::PointXYZ>& lidar_points);
+
+    // REACT stage-2 [🟧 D-3] host helpers: upload host vector to GPU memory.
+    // Caller owns the device pointer; pass it (and n_dyn) to renderDepthImage().
+    // freeDynamicSpheres() releases the GPU buffer and sets the pointer to nullptr.
+    void uploadDynamicSpheres(DynSphere **d_dyn, int *n_dyn, const std::vector<DynSphere> &host_spheres);
+    void freeDynamicSpheres(DynSphere **d_dyn, int *n_dyn);
 }
 #endif // CUDA_UTILS_CUH
