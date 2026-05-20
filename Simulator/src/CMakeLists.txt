@@ -76,4 +76,11 @@ target_link_libraries(dataset_generator ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${O
 # cudart_static.a references pthread_rwlockattr_init and modern ld with
 # --as-needed would otherwise drop libpthread before that resolution step.
 target_link_options(dataset_generator PRIVATE "LINKER:--no-as-needed")
+
+# REACT stage-2 [🟧 D-3] smoke test for the DynSphere CUDA path.
+# Minimal standalone (no ROS / no yaml); links raycast_cuda + PCL + OpenCV
+# + pthread (same DSO-needed workaround as dataset_generator).
+add_executable(test_dyn_sphere src/test_dyn_sphere.cpp)
+target_link_libraries(test_dyn_sphere ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} raycast_cuda Threads::Threads)
+target_link_options(test_dyn_sphere PRIVATE "LINKER:--no-as-needed")
 target_compile_definitions(dataset_generator PRIVATE CONFIG_FILE_PATH="${CMAKE_SOURCE_DIR}/config/config.yaml")
