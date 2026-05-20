@@ -72,4 +72,8 @@ target_compile_definitions(sensor_simulator_cuda PRIVATE CONFIG_FILE_PATH="${CMA
 
 add_executable(dataset_generator src/dataset_generator.cpp src/maps.cpp src/perlinnoise.cpp)
 target_link_libraries(dataset_generator ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} raycast_cuda yaml-cpp Threads::Threads)
+# Force-keep libpthread even when no .o references pthread directly --
+# cudart_static.a references pthread_rwlockattr_init and modern ld with
+# --as-needed would otherwise drop libpthread before that resolution step.
+target_link_options(dataset_generator PRIVATE "LINKER:--no-as-needed")
 target_compile_definitions(dataset_generator PRIVATE CONFIG_FILE_PATH="${CMAKE_SOURCE_DIR}/config/config.yaml")
