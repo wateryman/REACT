@@ -50,3 +50,26 @@ goal_yaw_std: 20.0
 # extend the map to avoid trajectory exceeding bounds (especially in z-axis) and treating the sky outside the map as obstacle
 map_expand_min: [0, 0, 0.2]
 map_expand_max: [0, 0, 6.0]
+
+# === REACT additions ===
+# 🟩 PEMTRS port (stage 1): reVAE is wired in YopoNetwork as an auxiliary
+# encoder; frame_buffer/selector/gru_decoder modules exist on disk but
+# are not yet on the training graph (single-frame dataset). They wake up
+# in stages 2 and 3.
+revae:
+  enable: true
+  latent_dim: 128
+  lam_recon: 1.0         # weight inside revae_loss
+  lam_kl: 0.001          # weight inside revae_loss (small to avoid posterior collapse)
+frame_buffer:
+  K: 10                  # sliding window size (5~15 per PEMTRS); inference-side only in stage 1
+selector:
+  d_model: 128
+  n_heads: 4
+  n_layers: 2
+  future_horizon: 5      # 🟧 N-step ROI prediction (REACT upgrade); stage 2 enables it
+gru_decoder:
+  hidden: 256
+  num_layers: 2
+loss_weights:
+  lam_vae: 0.1           # 🟩 multiplier applied to revae_loss in total training loss

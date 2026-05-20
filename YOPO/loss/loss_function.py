@@ -109,3 +109,14 @@ class YOPOLoss(nn.Module):
         goal_cost = self.goal_loss(Df, Dp, goal)
 
         return self.smoothness_weight * smoothness_cost, self.safety_weight * safety_cost, self.goal_weight * goal_cost, self.accele_weight * acceleration_cost
+
+    @staticmethod
+    def revae_loss(recon, target, mu, logvar, lam_recon: float = 1.0, lam_kl: float = 1e-3):
+        """🟩 PEMTRS reVAE loss = lam_recon * MSE(recon, target) + lam_kl * KL.
+
+        Sobel-edge component is added in stage 3 (losses/sobel_loss.py).
+        """
+        mse = th.nn.functional.mse_loss(recon, target)
+        # standard normal prior KL, mean-reduced over batch and latent
+        kl = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp()).mean()
+        return lam_recon * mse + lam_kl * kl
