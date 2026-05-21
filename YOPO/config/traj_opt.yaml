@@ -73,4 +73,20 @@ gru_decoder:
   hidden: 256
   num_layers: 2
 loss_weights:
-  lam_vae: 0.1           # 🟩 multiplier applied to revae_loss in total training loss
+  lam_vae: 0.1           # 🟩 stage-1: multiplier applied to revae_loss in total training loss
+  lam_dyn: 3.0           # 🟧 stage-3.1: motion_reshaped_collision_loss weight (highest per guide §3.6)
+  lam_kino: 0.5          # 🟧 stage-3.1: kinodynamic_loss weight
+
+# 🟧 stage-3.1 dynamic-obstacle losses (only applied when batch has dyn_obs)
+motion_reshaped:
+  alpha:  2.0            # closing-speed reshape gain; bigger -> bigger penalty for fast approaches
+  d_safe: 0.6            # m; softplus hinge below this surface distance
+kinodynamic:
+  v_max:  8.0            # m/s   (guide §3.6 default; align with controller envelope)
+  a_max: 10.0            # m/s^2
+  j_max: 30.0            # m/s^3
+# 🟧 stage-3.1: probability that a training step samples from dataset_dynamic/v1
+# instead of the static dataset.  Top-level key (NOT nested under `train`) because
+# config/config.py overrides `cfg["train"] = True` at load time, which would
+# clobber any nested setting there.
+dynamic_ratio: 0.5

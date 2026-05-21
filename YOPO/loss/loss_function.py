@@ -5,6 +5,8 @@ from config.config import cfg
 from loss.safety_loss import SafetyLoss
 from loss.smoothness_loss import SmoothnessLoss
 from loss.guidance_loss import GuidanceLoss
+from loss.motion_reshaped_esdf import motion_reshaped_collision_loss
+from loss.kinodynamic_loss import kinodynamic_loss as _kinodynamic_loss_fn
 
 
 class YOPOLoss(nn.Module):
@@ -120,3 +122,35 @@ class YOPOLoss(nn.Module):
         # standard normal prior KL, mean-reduced over batch and latent
         kl = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp()).mean()
         return lam_recon * mse + lam_kl * kl
+
+    @staticmethod
+    def dyn_collision_loss(trajectory, v_self, obstacles, obs_mask,
+                            lam_dyn: float = 1.0, alpha: float = 2.0, d_safe: float = 0.6):
+        """🟧 stage-3.1: weighted motion-reshaped collision loss.
+
+        Mirrors revae_loss's lam-in-kwarg pattern: the function returns the
+        already-weighted scalar so callers can sum without double-bookkeeping.
+        Pure math is in loss/motion_reshaped_esdf.py.
+
+        When obs_mask has zero True entries (i.e. a static-only batch with
+        no dynamic obstacles), the underlying loss is 0; this method
+        therefore composes safely into a single training step that mixes
+        static and dynamic samples.
+        """
+        return lam_dyn * motion_reshaped_collision_loss(
+            trajectory, v_self, obstacles, obs_mask, alpha=alpha, d_safe=d_safe)
+
+    @staticmethod
+    def kinodynamic_loss(waypoints, time_intervals,
+                          lam_kino: float = 1.0,
+                          v_max: float = 8.0, a_max: float = 10.0, j_max: float = 30.0):
+        """🟧 stage-3.1: weighted kinodynamic envelope loss + per-component dict.
+
+        Returns (lam_kino * total, components_dict).  The components are
+        detached scalars (vel/acc/jerk) so the trainer can log each on
+        tensorboard without affecting backprop.
+        Pure math is in loss/kinodynamic_loss.py.
+        """
+        total, comp = _kinodynamic_loss_fn(
+            waypoints, time_intervals, v_max=v_max, a_max=a_max, j_max=j_max)
+        return lam_kino * total, comp
