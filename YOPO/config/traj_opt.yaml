@@ -14,7 +14,7 @@ wc: 1.0    # collision    (distance to obstacle)
 
 # dataset: set image_size = primitive_num × downsampling_factor (×32 for ResNet-18) in each axis
 dataset_path: "../dataset"
-dataset_dynamic_path: "../dataset_dynamic/v1"   # 🟧 D-3 stage-2 v1 production bake (500 seq)
+dataset_dynamic_path: "../dataset_dynamic/v2"   # 🟦 stage-3.5 v2 production bake (2000 seq, 1.6 GB); v1 kept on disk for reproducibility
 image_height: 96
 image_width: 160
 
