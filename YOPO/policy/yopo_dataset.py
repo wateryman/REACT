@@ -327,8 +327,12 @@ class DynamicYOPOWrapper(YOPODataset):
     closing-speed signal.
     """
 
-    def __init__(self, mode='train', val_ratio=0.1):
+    def __init__(self, mode='train', val_ratio=0.1, return_kframe: bool = False):
         super().__init__(mode=mode, val_ratio=val_ratio, dynamic=True)
+        # 🟦 stage-3.4: when True, __getitem__ returns (K, 1, H, W) instead of
+        # (1, H, W) for the depth slot.  Default False keeps stage-3.1/3.2
+        # callers byte-clean.
+        self.return_kframe = bool(return_kframe)
         # The dynamic-mode super().__init__ early-returns before populating
         # these static-mode sampling fields, so we re-bind them here.
         self.vel_max = cfg["vel_max_train"]
@@ -359,10 +363,11 @@ class DynamicYOPOWrapper(YOPODataset):
     def __getitem__(self, idx):
         sample = self._load_dynamic(idx)   # dict with depth_seq, state_seq, dyn_obs, dt_seq, meta
 
-        # Last frame of the K-frame sequence as the "current frame" the
-        # single-frame YopoNetwork.forward will consume.
+        # depth_seq is the K-frame stack baked by Simulator stage-2 D-3.
+        # Stage-3.1/3.2 consume only the last frame; stage-3.4 path-a
+        # consumes all K frames (return_kframe=True).
         depth_seq = sample["depth_seq"]    # (K, 1, H, W) float32 in [0, 1]
-        image = depth_seq[-1]              # (1, H, W)
+        image = depth_seq if self.return_kframe else depth_seq[-1]
 
         st = sample["state_seq"][-1]
         pos = np.array(st["pos"], dtype=np.float32)
