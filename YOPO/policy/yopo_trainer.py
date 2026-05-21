@@ -82,16 +82,26 @@ class YopoTrainer:
     def train_one_epoch(self, epoch: int, total_progress):
         one_epoch_progress = self.progress_log.add_task(f"Epoch: {epoch}", total=len(self.train_dataloader))
         inspect_interval = max(1, len(self.train_dataloader) // 16)
-        traj_losses, score_losses, revae_losses, smooth_losses, safety_losses, goal_losses, acc_losses, start_time = [], [], [], [], [], [], [], time.time()
+        traj_losses, score_losses, revae_losses, dyn_losses, kino_losses, smooth_losses, safety_losses, goal_losses, acc_losses, start_time = [], [], [], [], [], [], [], [], [], time.time()
         lam_vae = cfg["loss_weights"]["lam_vae"]
         for step, (depth, pos, rot, obs_b, map_id) in enumerate(self.train_dataloader):  # obs: body frame
             if depth.shape[0] != self.batch_size:  continue  # batch size == number of env
 
             self.optimizer.zero_grad()
 
-            trajectory_loss, score_loss, revae_loss, smooth_cost, safety_cost, goal_cost, acc_cost = self.forward_and_compute_loss(depth, pos, rot, obs_b, map_id)
+            # 🟧 stage-3.1 C.2: 9-tuple includes dyn_loss + kino_loss.  dyn_obs is
+            # None here because the dataloader is the stage-1 static one; C.3
+            # introduces a mixed dataloader that fills dyn_obs.
+            (trajectory_loss, score_loss, revae_loss, dyn_loss, kino_loss,
+             smooth_cost, safety_cost, goal_cost, acc_cost) = self.forward_and_compute_loss(
+                depth, pos, rot, obs_b, map_id)
 
-            loss = self.loss_weight[0] * trajectory_loss + self.loss_weight[1] * score_loss + lam_vae * revae_loss
+            # dyn_loss and kino_loss are already lam-weighted by YOPOLoss wrappers.
+            loss = (self.loss_weight[0] * trajectory_loss
+                    + self.loss_weight[1] * score_loss
+                    + lam_vae * revae_loss
+                    + dyn_loss
+                    + kino_loss)
 
             # Optimize the policy
             loss.backward()
@@ -100,6 +110,8 @@ class YopoTrainer:
             traj_losses.append(self.loss_weight[0] * trajectory_loss.item())
             score_losses.append(self.loss_weight[1] * score_loss.item())
             revae_losses.append(lam_vae * revae_loss.item())
+            dyn_losses.append(dyn_loss.item())
+            kino_losses.append(kino_loss.item())
             smooth_losses.append(self.loss_weight[0] * smooth_cost.item())
             safety_losses.append(self.loss_weight[0] * safety_cost.item())
             goal_losses.append(self.loss_weight[0] * goal_cost.item())
@@ -109,16 +121,21 @@ class YopoTrainer:
                 batch_fps = inspect_interval / (time.time() - start_time)
                 self.progress_log.console.log(f"Epoch: {epoch}, Traj Loss: {np.mean(traj_losses):.3g}, "
                                               f"Score Loss: {np.mean(score_losses):.3g}, "
-                                              f"reVAE Loss: {np.mean(revae_losses):.3g} "
+                                              f"reVAE Loss: {np.mean(revae_losses):.3g}, "
+                                              f"Dyn Loss: {np.mean(dyn_losses):.3g}, "
+                                              f"Kino Loss: {np.mean(kino_losses):.3g} "
                                               f"Batch FPS: {batch_fps:.3g}")
-                self.tensorboard_log.add_scalar("Train/TrajLoss", np.mean(traj_losses), epoch * len(self.train_dataloader) + step)
-                self.tensorboard_log.add_scalar("Train/ScoreLoss", np.mean(score_losses), epoch * len(self.train_dataloader) + step)
-                self.tensorboard_log.add_scalar("Train/ReVAELoss", np.mean(revae_losses), epoch * len(self.train_dataloader) + step)
-                self.tensorboard_log.add_scalar("Detail/SmoothLoss", np.mean(smooth_losses), epoch * len(self.train_dataloader) + step)
-                self.tensorboard_log.add_scalar("Detail/SafetyLoss", np.mean(safety_losses), epoch * len(self.train_dataloader) + step)
-                self.tensorboard_log.add_scalar("Detail/GoalLoss", np.mean(goal_losses), epoch * len(self.train_dataloader) + step)
-                self.tensorboard_log.add_scalar("Detail/AccelLoss", np.mean(acc_losses), epoch * len(self.train_dataloader) + step)
-                traj_losses, score_losses, revae_losses, smooth_losses, safety_losses, goal_losses, acc_losses, start_time = [], [], [], [], [], [], [], time.time()
+                global_step = epoch * len(self.train_dataloader) + step
+                self.tensorboard_log.add_scalar("Train/TrajLoss",  np.mean(traj_losses),  global_step)
+                self.tensorboard_log.add_scalar("Train/ScoreLoss", np.mean(score_losses), global_step)
+                self.tensorboard_log.add_scalar("Train/ReVAELoss", np.mean(revae_losses), global_step)
+                self.tensorboard_log.add_scalar("Train/DynLoss",   np.mean(dyn_losses),   global_step)
+                self.tensorboard_log.add_scalar("Train/KinoLoss",  np.mean(kino_losses),  global_step)
+                self.tensorboard_log.add_scalar("Detail/SmoothLoss", np.mean(smooth_losses), global_step)
+                self.tensorboard_log.add_scalar("Detail/SafetyLoss", np.mean(safety_losses), global_step)
+                self.tensorboard_log.add_scalar("Detail/GoalLoss",   np.mean(goal_losses),   global_step)
+                self.tensorboard_log.add_scalar("Detail/AccelLoss",  np.mean(acc_losses),    global_step)
+                traj_losses, score_losses, revae_losses, dyn_losses, kino_losses, smooth_losses, safety_losses, goal_losses, acc_losses, start_time = [], [], [], [], [], [], [], [], [], time.time()
 
             self.progress_log.update(one_epoch_progress, advance=1)
             self.progress_log.update(total_progress, advance=1 / len(self.train_dataloader))
@@ -132,7 +149,8 @@ class YopoTrainer:
         for step, (depth, pos, rot, obs_b, map_id) in enumerate(self.val_dataloader):  # obs: body frame
             if depth.shape[0] != self.batch_size:  continue  # batch size == num of env
 
-            trajectory_loss, score_loss, _, _, _, _, _ = self.forward_and_compute_loss(depth, pos, rot, obs_b, map_id)
+            (trajectory_loss, score_loss, _, _, _, _, _, _, _) = self.forward_and_compute_loss(
+                depth, pos, rot, obs_b, map_id)
 
             traj_losses.append(self.loss_weight[0] * trajectory_loss.item())
             score_losses.append(self.loss_weight[1] * score_loss.item())
@@ -143,7 +161,21 @@ class YopoTrainer:
         self.tensorboard_log.add_scalar("Eval/ScoreLoss", np.mean(score_losses), epoch)
         self.progress_log.remove_task(one_epoch_progress)
 
-    def forward_and_compute_loss(self, depth, pos, rot, obs_b, map_id):
+    def forward_and_compute_loss(self, depth, pos, rot, obs_b, map_id, dyn_obs=None):
+        """🟧 stage-3.1 C.2: forward + losses with optional dynamic-obstacle path.
+
+        dyn_obs : tuple (obstacles_tensor, obs_mask_tensor) or None
+            obstacles_tensor : (B, M, 7) -- packed [px,py,pz, vx,vy,vz, radius]
+            obs_mask_tensor  : (B, M) bool -- True for real slots
+            When None (default), both dyn_collision_loss and kinodynamic_loss
+            return zero, so static-only training stays bit-identical to the
+            pre-C.2 trainer.  C.3 wires a dynamic dataloader that fills this.
+
+        Returns
+        -------
+        9-tuple (traj, score, revae, dyn, kino, smooth, safety, goal, acc)
+        where dyn and kino are already lam-weighted by the YOPOLoss wrappers.
+        """
         depth, pos, rot, obs_b, map_id = [x.to(self.device) for x in [depth, pos, rot, obs_b, map_id]]
 
         # 1. pre-process
@@ -159,7 +191,7 @@ class YopoTrainer:
 
         pos_expanded = pos.repeat_interleave(self.traj_num, dim=0)  # [B*V*H, 3]
         rot_expanded = rot.repeat_interleave(self.traj_num, dim=0)  # [B*V*H, 3, 3]
-        start_state_w = start_state_w.repeat_interleave(self.traj_num, dim=0)  # [B*V*H, 3, 3]
+        start_state_w_exp = start_state_w.repeat_interleave(self.traj_num, dim=0)  # [B*V*H, 3, 3]
         goal_w = goal_w.repeat_interleave(self.traj_num, dim=0)  # [B*V*H, 3]
 
         # [B*V*H, 3] [B*V*H, 3] [B*V*H, 3]
@@ -172,7 +204,7 @@ class YopoTrainer:
         # [B*V*H, 3, 3]: [px, py, pz; vx, vy, vz; ax, ay, az]
         end_state_w = torch.stack([end_pos_w, end_vel_w, end_acc_w], dim=1)
 
-        smooth_cost, safety_cost, goal_cost, acc_cost = self.yopo_loss(start_state_w, end_state_w, goal_w, map_id)
+        smooth_cost, safety_cost, goal_cost, acc_cost = self.yopo_loss(start_state_w_exp, end_state_w, goal_w, map_id)
         trajectory_loss = (smooth_cost + safety_cost + goal_cost + acc_cost).mean()
 
         score_label = (smooth_cost + safety_cost + goal_cost + acc_cost).clone().detach()
@@ -187,7 +219,44 @@ class YopoTrainer:
         else:
             revae_loss = torch.zeros((), device=self.device)
 
-        return trajectory_loss, score_loss, revae_loss, smooth_cost.mean(), safety_cost.mean(), goal_cost.mean(), acc_cost.mean()
+        # 🟧 stage-3.1: dyn-obs-aware losses.  Both gated on dyn_obs presence
+        # so static-only batches contribute exactly zero (regression-clean
+        # versus pre-C.2 baseline).  C.3 fills dyn_obs from the dynamic
+        # dataloader; until then this branch is never taken.
+        if dyn_obs is not None:
+            obstacles, obs_mask = dyn_obs
+            obstacles = obstacles.to(self.device)
+            obs_mask = obs_mask.to(self.device)
+            # Expand to per-anchor: (B, M, 7) -> (B*V*H, M, 7); same for mask
+            obs_expanded = obstacles.repeat_interleave(self.traj_num, dim=0)
+            mask_expanded = obs_mask.repeat_interleave(self.traj_num, dim=0)
+            # One waypoint per anchor (the predicted endstate position)
+            trajectory_pts = end_pos_w.unsqueeze(1)              # (B*V*H, 1, 3)
+            # v_self for closing-speed is the drone's CURRENT velocity (NOT
+            # the predicted endstate velocity), expanded per anchor.
+            v_self_exp = start_vel_w.repeat_interleave(self.traj_num, dim=0)  # (B*V*H, 3)
+            dyn_loss = self.yopo_loss.dyn_collision_loss(
+                trajectory_pts, v_self_exp, obs_expanded, mask_expanded,
+                lam_dyn=cfg["loss_weights"]["lam_dyn"],
+                alpha=cfg["motion_reshaped"]["alpha"],
+                d_safe=cfg["motion_reshaped"]["d_safe"])
+            # Kinodynamic envelope on the endstate (N=1 -> jerk skipped).
+            # end_state_w is (B*V*H, 3, 3) in [pos_row, vel_row, acc_row] x [x,y,z].
+            # Flatten to (B*V*H, 9): pos(3) | vel(3) | acc(3).
+            wp_for_kino = end_state_w.reshape(end_state_w.shape[0], 9).unsqueeze(1)  # (B*V*H, 1, 9)
+            dt_dummy = torch.ones(wp_for_kino.shape[0], 1, device=self.device) * 0.1  # ignored when N=1
+            kino_loss, _ = self.yopo_loss.kinodynamic_loss(
+                wp_for_kino, dt_dummy,
+                lam_kino=cfg["loss_weights"]["lam_kino"],
+                v_max=cfg["kinodynamic"]["v_max"],
+                a_max=cfg["kinodynamic"]["a_max"],
+                j_max=cfg["kinodynamic"]["j_max"])
+        else:
+            dyn_loss = torch.zeros((), device=self.device)
+            kino_loss = torch.zeros((), device=self.device)
+
+        return (trajectory_loss, score_loss, revae_loss, dyn_loss, kino_loss,
+                smooth_cost.mean(), safety_cost.mean(), goal_cost.mean(), acc_cost.mean())
 
     def save_model(self):
         if hasattr(self, "epoch_i"):

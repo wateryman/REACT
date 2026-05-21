@@ -61,13 +61,17 @@ def main():
         if depth.shape[0] != args.batch:
             continue
         trainer.optimizer.zero_grad()
-        traj, score, revae, _, _, _, _ = trainer.forward_and_compute_loss(
+        # 🟧 stage-3.1 C.2: 9-tuple now; dyn_loss and kino_loss are 0 here
+        # because we don't pass dyn_obs (stage-1 static path).
+        traj, score, revae, dyn, kino, _, _, _, _ = trainer.forward_and_compute_loss(
             depth, pos, rot, obs_b, map_id
         )
         loss = (
             trainer.loss_weight[0] * traj
             + trainer.loss_weight[1] * score
             + lam_vae * revae
+            + dyn        # 0 when dyn_obs not passed
+            + kino       # 0 when dyn_obs not passed
         )
         loss.backward()
         trainer.optimizer.step()
