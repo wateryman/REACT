@@ -82,6 +82,26 @@ ABLATIONS = [
         "dynamic_ratio": 0.5,
         "loss_weights.lam_dyn": 3.0,
         "loss_weights.lam_kino": 0.5,
+        "frame_buffer.enable_temporal": False,
+    }),
+    # 🟦 stage-3.4 path-a A/B on v2: same as E_full but with temporal forward.
+    # F is E_full repeated on v2 (sanity vs the v1 5k number, since the cfg
+    # already points at v2); G adds K-frame temporal forward.
+    ("F_v2_temporal_off", {
+        "revae.enable": True,
+        "dynamic_attention.enable": True,
+        "dynamic_ratio": 0.5,
+        "loss_weights.lam_dyn": 3.0,
+        "loss_weights.lam_kino": 0.5,
+        "frame_buffer.enable_temporal": False,
+    }),
+    ("G_v2_temporal_on", {
+        "revae.enable": True,
+        "dynamic_attention.enable": True,
+        "dynamic_ratio": 0.5,
+        "loss_weights.lam_dyn": 3.0,
+        "loss_weights.lam_kino": 0.5,
+        "frame_buffer.enable_temporal": True,
     }),
 ]
 
@@ -104,6 +124,8 @@ def snapshot_cfg():
         "dynamic_ratio":            cfg["dynamic_ratio"],
         "loss_weights.lam_dyn":     cfg["loss_weights"]["lam_dyn"],
         "loss_weights.lam_kino":    cfg["loss_weights"]["lam_kino"],
+        # 🟦 stage-3.4: frame_buffer.enable_temporal is the path-a knob.
+        "frame_buffer.enable_temporal": cfg["frame_buffer"].get("enable_temporal", False),
     }
 
 

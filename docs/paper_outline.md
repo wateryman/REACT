@@ -79,16 +79,16 @@ posterior collapse.
 against the V×H anchor tokens.  **Negative result** at current dataset
 scale (~1 % oscillation around path c); kept for ablation completeness.
 
-### 3.5 Temporal forward (stage-3.4, "path a") — *TBD architecture*
+### 3.5 Temporal forward (stage-3.4, "path a")
 
-Two candidate output forms:
-- **Option A** — keep anchor-grid head, swap depth input for K-frame
-  reVAE sequence.  Reuses all 3.3 losses; lowest implementation risk.
-- **Option B** — replace head with GRU decoder emitting an N-waypoint
-  trajectory.  Activates the kinodynamic envelope (3.3) at every
-  waypoint; higher ceiling, requires loss-rewiring.
+**Option A landed** (anchor-grid head preserved).  K-frame depth
+sequence (B, K=10, 1, H, W) → reVAE encodes each frame in parallel
+via batch reshape → `TemporalAggregator` (single-layer nn.GRU, 99 K
+params, hidden=128 = reVAE latent) → last hidden state takes the
+broadcast slot stage-1's z used to occupy.  YopoHead unchanged.
 
-Decision deferred (see §6 of `docs/ARCHITECTURE.md`).
+Option B (multi-waypoint GRU decoder output) explicitly deferred —
+would re-shape every stage-3.1 loss per waypoint; ~2-week scope.
 
 ---
 
@@ -127,9 +127,24 @@ DCA side channel adds <1 % (noise).  Full table in
 ### 5.3 Stage-3.2 DCA A/B (✅ done)
 5 k-iter A/B at fixed config: ~1 % `dyn_dyn` improvement, below noise.
 
-### 5.4 Stage-3.4 temporal vs single-frame (⏸ TBD)
-A/B between best stage-3.1 single-frame model and the K-frame temporal
-forward, on the v2 dynamic dataset.
+### 5.4 Stage-3.4 temporal vs single-frame (✅ done; negative result)
+
+A/B on v2 (5 k iter, batch=16, seed=42), `results/ablation_stage_3_4.csv`:
+
+| Row | total tail | stat_traj | dyn_traj | **dyn_dyn** | wall |
+|---|---:|---:|---:|---:|---:|
+| F temporal off | 4.261 | 3.544 | 3.762 | **0.2366** | 145 s |
+| G temporal on  | 4.187 | 3.559 | 3.770 | **0.2343** | 219 s |
+
+`dyn_dyn` improves **1.0 %** with K-frame forward — same order as the
+stage-3.2 DCA (~1 %).  Three independent architectural upgrades (loss
+weighting, side channel, temporal) all converge at the same ~1 %
+ceiling, strongly suggesting dataset scale (2 000 seq) is the
+binding constraint.
+
+Per-step wall +51 % (10× reVAE encodes).  Stage-5 deployment should
+revisit the DiffPhysDrone stateful-GRU pattern (1 encode + carried
+hidden) before profiling Jetson latency.
 
 ### 5.5 Deployment (⏸ TBD, stage-5)
 - Success rate over N dynamic scenarios (sim or real); target ≥85 %.

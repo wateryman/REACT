@@ -48,13 +48,22 @@ class YopoTrainer:
         # 🟧 stage-4: read revae.enable so the ablation can disable the
         # auxiliary encoder for the original-YOPO baseline row.
         use_revae = bool(cfg["revae"]["enable"])
+        # 🟦 stage-3.4 phase 3: read frame_buffer.enable_temporal.  When True,
+        # YopoNetwork instantiates the TemporalAggregator and consumes K-frame
+        # depth; trainer also flips DynamicYOPOWrapper to return K frames.
+        use_temporal = bool(cfg["frame_buffer"].get("enable_temporal", False))
+        self.use_temporal = use_temporal
+        self.K = int(cfg["frame_buffer"]["K"])
         self.policy = YopoNetwork(use_revae=use_revae,
                                    revae_latent=int(cfg["revae"]["latent_dim"]),
-                                   use_dca=use_dca, dca_n_heads=dca_n_heads)
+                                   use_dca=use_dca, dca_n_heads=dca_n_heads,
+                                   use_temporal=use_temporal)
         if use_dca:
             print(f"DCA side channel: ENABLED (n_heads={dca_n_heads})")
         if not use_revae:
             print(f"reVAE: DISABLED (ablation mode)")
+        if use_temporal:
+            print(f"Temporal forward: ENABLED (K={self.K})")
         self.policy = self.policy.to(self.device)
         try:
             state_dict = torch.load(checkpoint_path, weights_only=True)
@@ -82,8 +91,9 @@ class YopoTrainer:
         self.dynamic_ratio = float(cfg["dynamic_ratio"])
         if self.dynamic_ratio > 0.0:
             from policy.yopo_dataset import DynamicYOPOWrapper
+            # 🟦 stage-3.4 phase 3: wrapper returns (K,1,H,W) when use_temporal=True
             self.dyn_train_dataloader = DataLoader(
-                DynamicYOPOWrapper(mode='train'),
+                DynamicYOPOWrapper(mode='train', return_kframe=self.use_temporal),
                 batch_size=self.batch_size, shuffle=True,
                 num_workers=2, pin_memory=True)
             self.dyn_train_iter = iter(self.dyn_train_dataloader)
@@ -226,6 +236,15 @@ class YopoTrainer:
         """
         depth, pos, rot, obs_b, map_id = [x.to(self.device) for x in [depth, pos, rot, obs_b, map_id]]
 
+        # 🟦 stage-3.4 phase 3: temporal-mode shape coercion.
+        # YopoNetwork.forward(use_temporal=True) expects (B, K, 1, H, W).
+        # - Dynamic batches arrive (B, K, 1, H, W) from DynamicYOPOWrapper(return_kframe=True).
+        # - Static (and eval) batches arrive (B, 1, H, W); expand them to K identical
+        #   copies via stride-0 expand.  GRU on constant input converges to a
+        #   fixed-point hidden state (see docs/stage_3_4_research_cn.md F2).
+        if self.use_temporal and depth.dim() == 4:
+            depth = depth.unsqueeze(1).expand(-1, self.K, -1, -1, -1)
+
         # 1. pre-process
         goal_w, start_vel_w, start_acc_w = state_body2world(pos, rot, obs_b[:, 6:9], obs_b[:, 0:3], obs_b[:, 3:6])
         start_state_w = torch.stack([pos, start_vel_w, start_acc_w], dim=1)
@@ -283,7 +302,10 @@ class YopoTrainer:
         if recon is not None:
             lam_recon = cfg["revae"]["lam_recon"]
             lam_kl = cfg["revae"]["lam_kl"]
-            revae_loss = self.yopo_loss.revae_loss(recon, depth, mu, logvar,
+            # 🟦 stage-3.4: in temporal mode YopoNetwork reconstructs the last
+            # frame only, so the supervision target is also the last frame.
+            depth_target = depth[:, -1] if depth.dim() == 5 else depth
+            revae_loss = self.yopo_loss.revae_loss(recon, depth_target, mu, logvar,
                                                     lam_recon=lam_recon, lam_kl=lam_kl)
         else:
             revae_loss = torch.zeros((), device=self.device)

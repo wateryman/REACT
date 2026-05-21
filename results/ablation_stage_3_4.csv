@@ -1,0 +1,3 @@
+name,steps,wall_s,n_dyn,n_stat,total_head,total_tail,stat_traj_head,stat_traj_tail,dyn_traj_tail,dyn_dyn_head,dyn_dyn_tail,dyn_kino_tail,revae_tail
+F_v2_temporal_off,5000,145.4,2492,2508,5.6123,4.261,4.0367,3.5437,3.7622,0.2461,0.2366,0.0001,0.0355
+G_v2_temporal_on,5000,219.1,2441,2559,5.4652,4.1868,4.0342,3.5586,3.7705,0.2433,0.2343,0.0001,0.0427
