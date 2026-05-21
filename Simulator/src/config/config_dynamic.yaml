@@ -7,11 +7,11 @@
 
 # === REACT additions: bake mode + sequence params ===
 mode: "dynamic"                # 'static' (default) reuses original single-frame flow
-n_envs: 20                     # v2: doubled vs v1 (10) for stage-3.4 path-a
-n_seqs_per_env: 100            # v2: doubled vs v1 (50) -> 2000 seq total
+n_envs: 40                     # v3: doubled vs v2 (20); 4x v1 -- more env diversity
+n_seqs_per_env: 200            # v3: doubled vs v2 (100) -> 8000 seq total
 K: 10                          # frames per sequence
 dt: 0.0333                     # 30 Hz
-out_root: "../dataset_dynamic/v2"      # v2: stage-3.4 path-a scale (was v1: 500 seq)
+out_root: "../dataset_dynamic/v3"      # v3: stage-3.6 scale-up after stage-3.4 hit ~1% ceiling
 
 # Dynamic obstacle spawn parameters
 dyn_obs:
@@ -47,7 +47,7 @@ expand_x_times: 0
 expand_y_times: 0
 occupy_threshold: 0
 
-seed: 11                       # v2: different from v1 (seed=7) so the 2000 seq don't shadow v1's 500
+seed: 13                       # v3: different from v1 (7) and v2 (11) so envs are fresh
 x_length: 60
 y_length: 60
 z_length: 15
