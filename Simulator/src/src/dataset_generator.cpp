@@ -10,6 +10,10 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <random>
+#include <sstream>
+#include <string>
+#include <vector>
 #include "sensor_simulator.cuh"
 #include "maps.hpp"
 
@@ -80,9 +84,365 @@ void printProgressBar(int current, int total, int bar_width = 50)
     std::cout.flush();
 }
 
+// ============================================================================
+// REACT stage-2 [🟧 D-3] dynamic-dataset baking helpers
+// ============================================================================
+
+// Minimal inline JSON formatting (avoids an extra apt-install nlohmann/json3).
+// Only floats, fixed-key objects, and arrays are needed for our schema.
+namespace jsn
+{
+    inline std::string f(float x)
+    {
+        std::ostringstream oss;
+        oss << std::setprecision(7) << x;
+        return oss.str();
+    }
+    inline std::string vec3(float x, float y, float z)
+    {
+        return "[" + f(x) + "," + f(y) + "," + f(z) + "]";
+    }
+}
+
+struct DynamicBall
+{
+    Eigen::Vector3f pos;
+    Eigen::Vector3f vel;
+    float radius;
+
+    // Constant-velocity step with axis-aligned bbox reflection.
+    void step(float dt, const Eigen::Vector3f& bbox_lo, const Eigen::Vector3f& bbox_hi)
+    {
+        pos += vel * dt;
+        for (int k = 0; k < 3; ++k)
+        {
+            if (pos[k] < bbox_lo[k] || pos[k] > bbox_hi[k])
+            {
+                vel[k] *= -1.0f;
+                pos[k] = std::clamp(pos[k], bbox_lo[k], bbox_hi[k]);
+            }
+        }
+    }
+};
+
+static std::vector<DynamicBall> spawn_balls(std::mt19937& rng, const YAML::Node& dcfg,
+                                             const Eigen::Vector3f& bbox_lo,
+                                             const Eigen::Vector3f& bbox_hi)
+{
+    std::uniform_int_distribution<int> count_dist(dcfg["count_min"].as<int>(), dcfg["count_max"].as<int>());
+    std::uniform_real_distribution<float> speed_dist(dcfg["speed_min"].as<float>(), dcfg["speed_max"].as<float>());
+    std::uniform_real_distribution<float> radius_dist(dcfg["radius_min"].as<float>(), dcfg["radius_max"].as<float>());
+    std::uniform_real_distribution<float> u01(0.0f, 1.0f);
+    std::normal_distribution<float> normal01(0.0f, 1.0f);
+
+    int n = count_dist(rng);
+    std::vector<DynamicBall> balls;
+    balls.reserve(n);
+    for (int i = 0; i < n; ++i)
+    {
+        DynamicBall b;
+        b.pos.x() = bbox_lo.x() + u01(rng) * (bbox_hi.x() - bbox_lo.x());
+        b.pos.y() = bbox_lo.y() + u01(rng) * (bbox_hi.y() - bbox_lo.y());
+        b.pos.z() = bbox_lo.z() + u01(rng) * (bbox_hi.z() - bbox_lo.z());
+        // Random direction: gaussian unit vector with vertical damping
+        Eigen::Vector3f dir(normal01(rng), normal01(rng), 0.2f * normal01(rng));
+        dir.normalize();
+        b.vel = speed_dist(rng) * dir;
+        b.radius = radius_dist(rng);
+        balls.push_back(b);
+    }
+    return balls;
+}
+
+// Generates K consecutive drone poses at constant body-frame +X velocity.
+// Each frame is checked against the static kdtree for safe_dist; if any frame
+// fails the check, the whole trajectory is resampled (up to max_retry).
+struct DroneFrame
+{
+    Eigen::Vector3f pos;
+    Eigen::Quaternionf quat_wc;   // world->camera (includes pitch_bc baked in)
+    Eigen::Vector3f vel_world;
+};
+
+static std::vector<DroneFrame> sample_drone_traj_k_frames(
+    std::mt19937& rng, int K, float dt,
+    const YAML::Node& tcfg, const YAML::Node& main_cfg,
+    pcl::KdTreeFLANN<pcl::PointXYZ>& kdtree, float safe_dist,
+    const Eigen::Quaternionf& quat_bc, int max_retry = 32)
+{
+    float x_range    = main_cfg["x_range"].as<float>();
+    float y_range    = main_cfg["y_range"].as<float>();
+    float z_min      = main_cfg["z_range"][0].as<float>();
+    float z_max      = main_cfg["z_range"][1].as<float>();
+    float roll_range = main_cfg["roll_range"].as<float>();
+    float pitch_rng  = main_cfg["pitch_range"].as<float>();
+    float vx_min     = tcfg["v_body_x_min"].as<float>();
+    float vx_max     = tcfg["v_body_x_max"].as<float>();
+
+    std::normal_distribution<float> normal01(0.0f, 1.0f);
+    std::uniform_real_distribution<float> u01(0.0f, 1.0f);
+
+    for (int attempt = 0; attempt < max_retry; ++attempt)
+    {
+        Eigen::Vector3f pos_0;
+        pos_0.x() = -x_range / 2.0f + u01(rng) * x_range;
+        pos_0.y() = -y_range / 2.0f + u01(rng) * y_range;
+        pos_0.z() = z_min + u01(rng) * (z_max - z_min);
+        float roll  = normal01(rng) * roll_range / 3.0f;
+        float pitch = normal01(rng) * pitch_rng  / 3.0f;
+        float yaw   = u01(rng) * 360.0f;
+        Eigen::Quaternionf quat_wb = RPY2Quat(roll, pitch, yaw);
+        Eigen::Quaternionf quat_wc = quat_wb * quat_bc;
+        float vx = vx_min + u01(rng) * (vx_max - vx_min);
+        Eigen::Vector3f v_body(vx, 0.0f, 0.0f);
+        Eigen::Vector3f v_world = quat_wb * v_body;
+
+        std::vector<DroneFrame> traj;
+        traj.reserve(K);
+        bool ok = true;
+        for (int k = 0; k < K; ++k)
+        {
+            Eigen::Vector3f pos_k = pos_0 + v_world * (k * dt);
+            pcl::PointXYZ probe(pos_k.x(), pos_k.y(), pos_k.z());
+            std::vector<int> idx(1);
+            std::vector<float> sqd(1);
+            kdtree.nearestKSearch(probe, 1, idx, sqd);
+            if (std::sqrt(sqd[0]) < safe_dist)
+            {
+                ok = false;
+                break;
+            }
+            DroneFrame f;
+            f.pos = pos_k;
+            f.quat_wc = quat_wc;
+            f.vel_world = v_world;
+            traj.push_back(f);
+        }
+        if (ok) return traj;
+    }
+    return {};   // empty -> caller skips this seq
+}
+
+// Run one episode: spawn balls, sample drone traj, render K frames + write JSON.
+// Returns true on success, false if drone trajectory could not be sampled.
+static bool generate_one_sequence(GridMap& grid_map, CameraParams& camera,
+                                  pcl::KdTreeFLANN<pcl::PointXYZ>& kdtree,
+                                  float safe_dist, const Eigen::Quaternionf& quat_bc,
+                                  std::mt19937& rng, int env_id, int seq_id, int K, float dt,
+                                  const YAML::Node& dcfg, const YAML::Node& tcfg,
+                                  const YAML::Node& main_cfg, const fs::path& seq_dir)
+{
+    Eigen::Vector3f bbox_lo(-dcfg["bbox_xy_half"].as<float>(),
+                            -dcfg["bbox_xy_half"].as<float>(),
+                             dcfg["bbox_z_lo"].as<float>());
+    Eigen::Vector3f bbox_hi( dcfg["bbox_xy_half"].as<float>(),
+                             dcfg["bbox_xy_half"].as<float>(),
+                             dcfg["bbox_z_hi"].as<float>());
+
+    auto balls = spawn_balls(rng, dcfg, bbox_lo, bbox_hi);
+    auto traj  = sample_drone_traj_k_frames(rng, K, dt, tcfg, main_cfg, kdtree, safe_dist, quat_bc);
+    if (traj.empty()) return false;
+
+    fs::create_directories(seq_dir);
+
+    DynSphere* d_dyn = nullptr;
+    int n_dyn = 0;
+
+    // ---- per-frame loop: step balls, upload, render, log ----
+    // dyn_obs.json: per-frame array of obstacle dicts
+    // state.json:   per-frame drone dict (pos, quat_wc, vel_world)
+    std::ostringstream dyn_obs_json;
+    std::ostringstream state_json;
+    dyn_obs_json << "[";
+    state_json << "[";
+
+    for (int k = 0; k < K; ++k)
+    {
+        // ball state at frame k is the state AFTER stepping from the prior frame.
+        // For k=0 we log the spawn state without stepping; for k>=1 we step first.
+        if (k > 0)
+            for (auto& b : balls) b.step(dt, bbox_lo, bbox_hi);
+
+        // upload to GPU
+        std::vector<DynSphere> sph;
+        sph.reserve(balls.size());
+        for (const auto& b : balls)
+            sph.push_back({ make_float3(b.pos.x(), b.pos.y(), b.pos.z()), b.radius });
+        uploadDynamicSpheres(&d_dyn, &n_dyn, sph);
+
+        // render
+        const DroneFrame& df = traj[k];
+        cudaMat::SE3<float> T_wc(df.quat_wc.w(), df.quat_wc.x(), df.quat_wc.y(), df.quat_wc.z(),
+                                 df.pos.x(), df.pos.y(), df.pos.z());
+        cv::Mat depth_image;
+        renderDepthImage(&grid_map, &camera, T_wc, depth_image, d_dyn, n_dyn);
+
+        // save depth: same normalized uint16 format as YOPO static dataset
+        // (saveDepthAs16BitPNG: depth / max_depth_dist * 65535).
+        std::string depth_path = (seq_dir / ("depth_t" + std::to_string(k) + ".png")).string();
+        saveDepthAs16BitPNG(depth_image, camera.max_depth_dist, depth_path);
+
+        // log dyn_obs (per-frame ball list)
+        if (k > 0) dyn_obs_json << ",";
+        dyn_obs_json << "[";
+        for (size_t i = 0; i < balls.size(); ++i)
+        {
+            if (i > 0) dyn_obs_json << ",";
+            dyn_obs_json << "{\"pos\":"    << jsn::vec3(balls[i].pos.x(),  balls[i].pos.y(),  balls[i].pos.z())
+                         << ",\"vel\":"   << jsn::vec3(balls[i].vel.x(),  balls[i].vel.y(),  balls[i].vel.z())
+                         << ",\"radius\":" << jsn::f(balls[i].radius)
+                         << ",\"kind\":\"sphere\"}";
+        }
+        dyn_obs_json << "]";
+
+        // log state (drone pose)
+        if (k > 0) state_json << ",";
+        state_json << "{\"pos\":"  << jsn::vec3(df.pos.x(), df.pos.y(), df.pos.z())
+                   << ",\"quat_wc\":[" << jsn::f(df.quat_wc.w()) << "," << jsn::f(df.quat_wc.x())
+                   << "," << jsn::f(df.quat_wc.y()) << "," << jsn::f(df.quat_wc.z()) << "]"
+                   << ",\"vel_world\":" << jsn::vec3(df.vel_world.x(), df.vel_world.y(), df.vel_world.z())
+                   << "}";
+    }
+    dyn_obs_json << "]";
+    state_json << "]";
+
+    std::ofstream(seq_dir / "dyn_obs.json") << dyn_obs_json.str();
+    std::ofstream(seq_dir / "state.json")  << state_json.str();
+
+    // meta.json -- intrinsics self-check + seq params
+    std::ostringstream meta;
+    meta << "{\"K\":" << K << ",\"dt\":" << jsn::f(dt)
+         << ",\"env_id\":" << env_id << ",\"seq_id\":" << seq_id
+         << ",\"intrinsics\":{\"fx\":" << jsn::f(camera.fx) << ",\"fy\":" << jsn::f(camera.fy)
+         << ",\"cx\":" << jsn::f(camera.cx) << ",\"cy\":" << jsn::f(camera.cy)
+         << ",\"W\":" << camera.image_width << ",\"H\":" << camera.image_height
+         << ",\"max_depth_m\":" << jsn::f(camera.max_depth_dist) << "}"
+         << ",\"depth_encoding\":\"uint16_normalized_by_max_depth\"}";
+    std::ofstream(seq_dir / "meta.json") << meta.str();
+
+    freeDynamicSpheres(&d_dyn, &n_dyn);
+    return true;
+}
+
+// Orchestrator for `mode: dynamic`. Builds static map per env (same logic as
+// static main loop), then for each env loops over n_seqs_per_env sequences.
+static int run_dynamic_mode(const YAML::Node& cfg)
+{
+    // camera params (same as static path)
+    CameraParams camera;
+    camera.fx              = cfg["camera"]["fx"].as<float>();
+    camera.fy              = cfg["camera"]["fy"].as<float>();
+    camera.cx              = cfg["camera"]["cx"].as<float>();
+    camera.cy              = cfg["camera"]["cy"].as<float>();
+    camera.image_width     = cfg["camera"]["image_width"].as<int>();
+    camera.image_height    = cfg["camera"]["image_height"].as<int>();
+    camera.max_depth_dist  = cfg["camera"]["max_depth_dist"].as<float>();
+    camera.normalize_depth = cfg["camera"]["normalize_depth"].as<bool>();
+    float pitch = cfg["camera"]["pitch"].as<float>() * M_PI / 180.0f;
+    Eigen::Quaternionf quat_bc(Eigen::AngleAxisf(pitch, Eigen::Vector3f::UnitY()));
+
+    // map params
+    float resolution = cfg["resolution"].as<float>();
+    int occupy_threshold = cfg["occupy_threshold"].as<int>();
+    int seed = cfg["seed"].as<int>();
+    int sizeX = cfg["x_length"].as<int>();
+    int sizeY = cfg["y_length"].as<int>();
+    int sizeZ = cfg["z_length"].as<int>();
+    double scale = 1.0 / resolution;
+    sizeX = sizeX * scale;
+    sizeY = sizeY * scale;
+    sizeZ = sizeZ * scale;
+    float safe_dist = cfg["safe_dist"].as<float>();
+    float ply_res   = cfg["ply_res"].as<float>();
+
+    // dynamic params
+    int n_envs         = cfg["n_envs"].as<int>();
+    int n_seqs_per_env = cfg["n_seqs_per_env"].as<int>();
+    int K              = cfg["K"].as<int>();
+    float dt           = cfg["dt"].as<float>();
+    std::string out_root = cfg["out_root"].as<std::string>();
+    const YAML::Node& dcfg = cfg["dyn_obs"];
+    const YAML::Node& tcfg = cfg["drone_traj"];
+
+    prepareSavePath(out_root, true);
+    std::cout << "[REACT D-3] mode=dynamic, n_envs=" << n_envs
+              << ", n_seqs_per_env=" << n_seqs_per_env
+              << ", K=" << K << ", dt=" << dt << " s" << std::endl;
+
+    int total_seqs = n_envs * n_seqs_per_env;
+    int done = 0, failed = 0;
+    for (int env_id = 0; env_id < n_envs; ++env_id)
+    {
+        // build static scene exactly like static main() does
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>());
+        mocka::Maps::BasicInfo info;
+        info.sizeX = sizeX;
+        info.sizeY = sizeY;
+        info.sizeZ = sizeZ;
+        info.seed  = seed + env_id;
+        info.scale = scale;
+        info.cloud = cloud;
+        mocka::Maps map;
+        map.setParam(cfg);
+        map.setInfo(info);
+        map.generate(cfg["maze_type"].as<int>());
+
+        GridMap grid_map(cloud, resolution, occupy_threshold);
+
+        // filtered cloud for kdtree (same voxel size as static path)
+        pcl::PointCloud<pcl::PointXYZ>::Ptr filtered_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+        pcl::VoxelGrid<pcl::PointXYZ> sor;
+        sor.setInputCloud(cloud);
+        sor.setLeafSize(ply_res, ply_res, ply_res);
+        sor.filter(*filtered_cloud);
+        pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
+        kdtree.setInputCloud(filtered_cloud);
+
+        // save the pointcloud beside env_X/  (so ESDF in stage-3 can reload)
+        std::ostringstream env_name;
+        env_name << "env_" << std::setfill('0') << std::setw(4) << env_id;
+        fs::path env_dir = fs::path(out_root) / env_name.str();
+        fs::create_directories(env_dir);
+        savePointCloudAsPLY(filtered_cloud, (env_dir / "pointcloud.ply").string());
+
+        std::mt19937 rng(seed + env_id * 1000);
+        for (int s = 0; s < n_seqs_per_env; ++s)
+        {
+            std::ostringstream seq_name;
+            seq_name << "seq_" << std::setfill('0') << std::setw(4) << s;
+            fs::path seq_dir = env_dir / seq_name.str();
+            bool ok = generate_one_sequence(grid_map, camera, kdtree, safe_dist, quat_bc,
+                                            rng, env_id, s, K, dt, dcfg, tcfg, cfg, seq_dir);
+            if (!ok) { ++failed; }
+            ++done;
+            printProgressBar(done, total_seqs);
+        }
+        grid_map.freeGridMap();
+    }
+    std::cout << "\n[REACT D-3] done: " << (total_seqs - failed) << "/" << total_seqs
+              << " sequences (" << failed << " skipped after retries)" << std::endl;
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
-    YAML::Node config = YAML::LoadFile(CONFIG_FILE_PATH);
+    // REACT stage-2 [🟧 D-3]: optional `--config <path>` argv flag overrides
+    // the compile-time CONFIG_FILE_PATH macro. Default (no flag) preserves
+    // the original behaviour byte-for-byte.
+    std::string config_path = CONFIG_FILE_PATH;
+    for (int i = 1; i + 1 < argc; ++i)
+    {
+        if (std::string(argv[i]) == "--config")
+            config_path = argv[i + 1];
+    }
+    std::cout << "[REACT] config: " << config_path << std::endl;
+    YAML::Node config = YAML::LoadFile(config_path);
+
+    // REACT stage-2 [🟧 D-3]: dispatch on `mode`. Absent or "static" runs the
+    // original single-frame flow below. "dynamic" runs the K-frame baker.
+    std::string mode = config["mode"] ? config["mode"].as<std::string>() : "static";
+    if (mode == "dynamic")
+        return run_dynamic_mode(config);
 
     // 1. 相机参数
     CameraParams camera;

@@ -1,0 +1,107 @@
+# REACT stage-2 [🟧 D-3] dynamic dataset baking config
+# Run with:
+#   ./devel/lib/sensor_simulator/dataset_generator \
+#       --config $(rospack find sensor_simulator)/config/config_dynamic.yaml
+#
+# Smoke = (n_envs=1, n_seqs_per_env=5) ; v1 production = (n_envs=10, n_seqs_per_env=50)
+
+# === REACT additions: bake mode + sequence params ===
+mode: "dynamic"                # 'static' (default) reuses original single-frame flow
+n_envs: 1                      # smoke 1; v1 production 10
+n_seqs_per_env: 5              # smoke 5; v1 production 50
+K: 10                          # frames per sequence
+dt: 0.0333                     # 30 Hz
+out_root: "../dataset_dynamic/smoke"   # relative to where dataset_generator runs
+
+# Dynamic obstacle spawn parameters
+dyn_obs:
+  count_min: 3                 # per sequence: 3~8 balls (uniform int)
+  count_max: 8
+  speed_min: 1.0               # m/s, isotropic random direction
+  speed_max: 5.0
+  radius_min: 0.3              # m
+  radius_max: 0.6
+  bbox_xy_half: 15.0           # m, balls bounce inside [-bbox, bbox]^2 in xy
+  bbox_z_lo: 0.5
+  bbox_z_hi: 6.0
+
+# Drone trajectory: constant body-frame +X velocity for K frames
+drone_traj:
+  v_body_x_min: 1.0            # m/s, body-frame forward speed
+  v_body_x_max: 4.0
+
+# === Below: identical fields to config.yaml; static-map generation stays unchanged ===
+odom_topic: "/sim/odom"
+depth_topic: "/depth_image"
+lidar_topic: "/lidar_points"
+
+render_depth: true
+depth_fps: 33
+render_lidar: false            # disabled during baking (only depth needed)
+lidar_fps: 10
+
+random_map: true
+resolution: 0.1
+ply_file: "src/pointcloud/forest.ply"
+expand_x_times: 0
+expand_y_times: 0
+occupy_threshold: 0
+
+seed: 7                        # different from config.yaml seed=3 so dynamic ≠ static map
+x_length: 60
+y_length: 60
+z_length: 15
+maze_type: 5                   # 5: forest (same as static dataset)
+complexity: 0.02
+fill: 0.1
+fractal: 1
+attenuation: 0.1
+width_min: 0.6
+width_max: 1.5
+obstacle_number: 100
+road_width: 3
+add_wall_x: 1
+add_wall_y: 1
+tree_file: "src/pointcloud/tree.ply"
+tree_dist: 4
+room_number: 4
+max_windows: 2
+window_size_min: 2.0
+window_size_max: 2.8
+add_ceiling: 0
+wall_width_min: 0.5
+wall_width_max: 6.0
+wall_thick: 0.5
+wall_number: 100
+wall_ceiling: 1
+
+camera:
+  fx: 80.0
+  fy: 80.0
+  cx: 80.0
+  cy: 45.0
+  image_width: 160
+  image_height: 90
+  max_depth_dist: 20.0
+  normalize_depth: false       # IMPORTANT: keep raw meters for png * 1000 mm encoding
+  pitch: 0.0
+
+lidar:                          # unused during baking but required by yaml parser
+  vertical_lines: 16
+  vertical_angle_start: -15.0
+  vertical_angle_end: 15.0
+  horizontal_num: 360
+  horizontal_resolution: 1.0
+  max_lidar_dist: 20.0
+
+# Static-dataset-only fields below (kept so YAML schema is identical to config.yaml)
+save_path: "../dataset/"        # unused in dynamic mode (we use out_root instead)
+env_num: 10
+image_num: 10000
+roll_range: 30
+pitch_range: 30
+x_range: 40
+y_range: 40
+z_range: [0.5, 4]
+safe_dist: 0.5
+ply_res: 0.1
