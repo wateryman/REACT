@@ -7,11 +7,11 @@
 
 # === REACT additions: bake mode + sequence params ===
 mode: "dynamic"                # 'static' (default) reuses original single-frame flow
-n_envs: 1                      # smoke 1; v1 production 10
-n_seqs_per_env: 5              # smoke 5; v1 production 50
+n_envs: 10                     # v1 production 10; smoke was 1
+n_seqs_per_env: 50             # v1 production 50; smoke was 5
 K: 10                          # frames per sequence
 dt: 0.0333                     # 30 Hz
-out_root: "../dataset_dynamic/smoke"   # relative to where dataset_generator runs
+out_root: "../dataset_dynamic/v1"      # production 'v1'; smoke output was 'smoke'
 
 # Dynamic obstacle spawn parameters
 dyn_obs:
