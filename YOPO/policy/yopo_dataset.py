@@ -1,4 +1,6 @@
 import os, sys
+import glob
+import json
 import cv2
 import time
 import torch
@@ -11,11 +13,41 @@ from config.config import cfg
 
 
 class YOPODataset(Dataset):
-    def __init__(self, mode='train', val_ratio=0.1):
+    def __init__(self, mode='train', val_ratio=0.1, dynamic=False, K=None):
         super(YOPODataset, self).__init__()
-        # image params
+        # image params (shared by both modes)
         self.height = int(cfg["image_height"])
         self.width = int(cfg["image_width"])
+
+        # REACT stage-2 [🟧 D-3] dynamic-mode branch.  Entirely separate from
+        # the static-mode bookkeeping below so the static fast-path is
+        # bit-identical to pre-change behaviour when dynamic=False.
+        self.dynamic = dynamic
+        if dynamic:
+            self.K = int(K) if K is not None else int(cfg["frame_buffer"]["K"])
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            data_dir = os.path.join(base_dir, "..", cfg["dataset_dynamic_path"])
+            all_seqs = sorted(glob.glob(os.path.join(data_dir, "env_*", "seq_*")))
+            if not all_seqs:
+                raise FileNotFoundError(
+                    f"No env_*/seq_* directories under {data_dir}.  "
+                    f"Did you bake the dynamic dataset (Simulator stage-2 2.d)?"
+                )
+            train_seqs, val_seqs = train_test_split(
+                all_seqs, test_size=val_ratio, random_state=0)
+            if mode == 'train':
+                self.seq_dirs = train_seqs
+            elif mode == 'valid':
+                self.seq_dirs = val_seqs
+            else:
+                raise ValueError(f"Invalid mode {mode}. Choose from 'train', 'valid'.")
+            if mode == 'train':
+                print(f"=============== {mode.capitalize()} Dynamic Data Summary ===============")
+                print(f"{'Sequences'   :<12} | Count: {len(self.seq_dirs):<3} | K={self.K} frames each")
+                print(f"{'Image size'  :<12} | {self.width} x {self.height} (resized from raw 160x90)")
+                print("====================================================")
+            return
+        # ----- static-mode fields below -----
         # ramdom state: x-direction: log-normal distribution, yz-direction: normal distribution
         self.vel_max = cfg["vel_max_train"]
         self.acc_max = cfg["acc_max_train"]
@@ -78,9 +110,13 @@ class YOPODataset(Dataset):
         print("==================================================")
 
     def __len__(self):
+        if self.dynamic:
+            return len(self.seq_dirs)
         return len(self.img_list)
 
     def __getitem__(self, item):
+        if self.dynamic:
+            return self._load_dynamic(item)
         # 1. read the image
         # NOTE: The depth images are normalized from 0–20m to a 0–1 and converted to int16 during data collection.
         image = cv2.imread(self.img_list[item], -1).astype(np.float32)
@@ -105,6 +141,40 @@ class YOPODataset(Dataset):
         rot_wb = R_WB.as_matrix().astype(np.float32)  # transform to rot_matrix in numpy is faster than using quat in pytorch
         # vel & acc & goal are in body frame, NWU, and no-normalization
         return image, self.positions[item], rot_wb, random_obs, self.map_idx[item]
+
+    # REACT stage-2 [🟧 D-3] dynamic-mode loader.  Reads one K-frame sequence
+    # baked by Simulator/src/src/dataset_generator.cpp (mode: dynamic).
+    # Returns a dict (NOT a tuple) so the trainer can dispatch on key
+    # presence rather than tuple length; the static path's 5-tuple stays
+    # untouched.  Note: list/dict fields (state_seq, dyn_obs, meta) are
+    # NOT torch-tensors and need a custom collate_fn at the dataloader if
+    # batch_size > 1 with num_workers > 0.  Stage-3 will write that
+    # collate_fn when it wires the dynamic data into training.
+    def _load_dynamic(self, item):
+        seq_dir = self.seq_dirs[item]
+        # ---- K depth frames -> (K, 1, H, W) in [0, 1] (same scale as static)
+        depth_seq = np.zeros((self.K, 1, self.height, self.width), dtype=np.float32)
+        for k in range(self.K):
+            raw = cv2.imread(os.path.join(seq_dir, f"depth_t{k}.png"), cv2.IMREAD_UNCHANGED)
+            d = raw.astype(np.float32) / 65535.0   # uint16 normalized by max_depth_m -> [0, 1]
+            d = cv2.resize(d, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
+            depth_seq[k, 0] = d
+
+        # ---- per-frame drone state + dynamic obstacles + meta ----
+        with open(os.path.join(seq_dir, "state.json")) as f:
+            state_seq = json.load(f)
+        with open(os.path.join(seq_dir, "dyn_obs.json")) as f:
+            dyn_obs = json.load(f)
+        with open(os.path.join(seq_dir, "meta.json")) as f:
+            meta = json.load(f)
+        dt = float(meta["dt"])
+        return dict(
+            depth_seq=depth_seq,                          # (K, 1, H, W) float32 in [0, 1]
+            state_seq=state_seq,                          # list[K] of {pos, quat_wc, vel_world}
+            dyn_obs=dyn_obs,                              # list[K] of list[N_k] of {pos, vel, radius, kind}
+            dt_seq=np.full(self.K, dt, dtype=np.float32), # (K,) seconds
+            meta=meta,                                    # {K, dt, env_id, seq_id, intrinsics, depth_encoding}
+        )
 
     def _get_random_state(self):
         while True:
