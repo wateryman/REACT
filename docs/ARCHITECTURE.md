@@ -297,6 +297,71 @@ included as a fast-iteration reproduction target:
   - 2 k (~5 min):  `python scripts/run_stage4_ablation.py --steps 2000`
   - 5 k (~13 min): `python scripts/run_stage4_ablation.py --steps 5000 --out results/ablation_5k.csv`
 
+## Stage-3.4 K-frame temporal forward (path a, `v0.3.4-temporal`)
+
+Per `docs/stage_3_4_design_cn.md` Option A: depth input becomes
+(B, K, 1, H, W); reVAE encodes all K frames; `TemporalAggregator`
+(nn.GRU, 99 K params) reduces the K-step latent sequence to a single
+embedding that takes the broadcast slot stage-1's z used to occupy.
+**The YopoHead anchor grid and every stage-3.1 loss are unchanged.**
+
+### A/B on v2 dataset (5 k iter, batch=16, seed=42)
+
+| Metric | F temporal off | G temporal on | Δ |
+|---|---:|---:|---:|
+| total tail | 4.261 | 4.187 | -0.074 (-1.7 %) |
+| stat_traj tail | 3.544 | 3.559 | +0.015 (+0.4 %) |
+| dyn_traj tail | 3.762 | 3.770 | +0.008 (+0.2 %) |
+| **dyn_dyn tail** | **0.2366** | **0.2343** | **-0.0023 (-1.0 %)** |
+| dyn_kino tail | 0.0001 | 0.0001 | 0 |
+| reVAE tail | 0.0355 | 0.0427 | +0.0072 (+20 %) |
+| wall_s | 145.4 | 219.1 | **+51 %** |
+
+Full CSV at `results/ablation_stage_3_4.csv`.
+
+### Verdict: another <1 % negative result, but for a *different* reason
+
+The path-a K-frame forward improves `dyn_dyn` by **1.0 %** — same order
+as the stage-3.2 DCA side channel's ~1 % (on v1) and its v2 retry
+(also ~1 %, row F vs E_full on v2).  **Three independent architectural
+upgrades all converge at the same ~1 % ceiling.**
+
+The §1 success criterion (≥5 % dyn_dyn drop) was not met.  But path-a
+fails *differently* from path-b:
+
+- Path-b (DCA) hand-feeds the network GT obstacle tokens; if the
+  network couldn't use them at 500-2000 seq, more architecture won't
+  help.
+- Path-a (temporal) lets the network *find* the motion signal itself
+  from the K-frame depth sequence.  This is a strictly more flexible
+  formulation that subsumes path-b's information content.
+
+Both failing at ~1 % on independent mechanisms strongly suggests the
+bottleneck is **dataset scale, not architecture**.  All three temporal
+papers surveyed in `docs/stage_3_4_research_cn.md` used at least 10×
+more data (UCF101: 13 k clips; DiffPhysDrone: unbounded RL).
+
+### Compute cost
+
+K-frame temporal adds **+51 % wall** per training step (10× more reVAE
+encodes, partially amortised by the GPU keeping the backbone+head warm
+across the same step).  At inference, the same K=10 stateless path
+would multiply the per-frame latency by ≈10× over stage-3.1.  Stage-5
+deployment should re-investigate the DiffPhysDrone stateful-GRU
+pattern (single-frame encode + persistent hidden) before profiling on
+Jetson.
+
+### Implication for the paper
+
+- Path-a (temporal) goes into the ablation table as a third row showing
+  "architectural upgrade does not separate from baseline at this dataset
+  scale".  Combined with paths b and c this paints a clear "next
+  experiment" arrow: scale dynamic data to 10 k+ sequences.
+- Headline contribution stays stage-3.1 (dyn/kino loss).  Stage-3.2 and
+  Stage-3.4 are the two ablation rows.
+- Reproduction:
+  - `python scripts/run_stage4_ablation.py --steps 5000 --only F_v2_temporal_off,G_v2_temporal_on --out results/ablation_stage_3_4.csv`
+
 ## Build/run commands at a glance
 
 ```bash
