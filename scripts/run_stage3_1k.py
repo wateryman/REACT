@@ -45,7 +45,7 @@ def main():
         learning_rate=args.lr,
         batch_size=args.batch,
         loss_weight=[1.0, 1.0],
-        tensorboard_path="saved",
+        tensorboard_path="saved/_scratch",
         checkpoint_path="",
         save_on_exit=False,
     )
