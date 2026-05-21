@@ -77,10 +77,15 @@ loss_weights:
   lam_dyn: 3.0           # 🟧 stage-3.1: motion_reshaped_collision_loss weight (highest per guide §3.6)
   lam_kino: 0.5          # 🟧 stage-3.1: kinodynamic_loss weight
 
-# 🟧 stage-3.1: max obstacle slots packed per batch (DynamicYOPOWrapper pads to this).
-# Stage-3.2 will also reuse this for DynamicCrossAttention's max_dyn_obs tokens.
+# 🟧 stage-3.1+3.2 dynamic-attention config.
+# max_dyn_obs (stage-3.1): obstacle slots packed per batch by DynamicYOPOWrapper.
+# enable / n_heads (stage-3.2): turn on the DCA side channel inside YopoNetwork.
+# When enable=false, YopoNetwork(use_dca=False) leaves the DCA modules
+# uninstantiated -> param count + training dynamics identical to stage-3.1.
 dynamic_attention:
   max_dyn_obs: 8
+  enable: true        # 🟧 stage-3.2: side-channel DCA on
+  n_heads: 1          # head_in = 201 isn't divisible by 4; 1 head is safe
 
 # 🟧 stage-3.1 dynamic-obstacle losses (only applied when batch has dyn_obs)
 motion_reshaped:

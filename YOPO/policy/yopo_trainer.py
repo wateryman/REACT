@@ -41,7 +41,13 @@ class YopoTrainer:
 
         # network
         print("Loading network...")
-        self.policy = YopoNetwork()
+        # 🟧 stage-3.2 sub-C: optional DCA side channel.  When cfg flag is off,
+        # YopoNetwork(use_dca=False) matches stage-3.1 byte-for-byte.
+        use_dca = bool(cfg["dynamic_attention"]["enable"])
+        dca_n_heads = int(cfg["dynamic_attention"]["n_heads"])
+        self.policy = YopoNetwork(use_dca=use_dca, dca_n_heads=dca_n_heads)
+        if use_dca:
+            print(f"DCA side channel: ENABLED (n_heads={dca_n_heads})")
         self.policy = self.policy.to(self.device)
         try:
             state_dict = torch.load(checkpoint_path, weights_only=True)
@@ -217,8 +223,29 @@ class YopoTrainer:
         goal_w, start_vel_w, start_acc_w = state_body2world(pos, rot, obs_b[:, 6:9], obs_b[:, 0:3], obs_b[:, 3:6])
         start_state_w = torch.stack([pos, start_vel_w, start_acc_w], dim=1)
 
+        # 🟧 stage-3.2 sub-C: when a dynamic batch is supplied, build per-anchor
+        # cross-attention tokens (drone-relative position + absolute world vel +
+        # radius) and pass to the policy.  The wrapper has shape (B, M, 7) world.
+        # We subtract the drone world position to get relative position; vel and
+        # radius pass through unchanged.  No rotation -- network learns yaw
+        # invariance from its random-obs training distribution.
+        dyn_tokens_for_net = None
+        dyn_mask_for_net = None
+        if dyn_obs is not None:
+            obstacles_w, obs_mask = dyn_obs
+            obstacles_w = obstacles_w.to(self.device)
+            obs_mask = obs_mask.to(self.device)
+            rel_pos = obstacles_w[..., 0:3] - pos.unsqueeze(1)      # (B, M, 3)
+            abs_vel = obstacles_w[..., 3:6]                          # (B, M, 3)
+            radius  = obstacles_w[..., 6:7]                          # (B, M, 1)
+            dyn_tokens_for_net = torch.cat([rel_pos, abs_vel, radius], dim=-1)
+            dyn_mask_for_net = obs_mask
+
         # 2. forward propagation (REACT: inference now returns reVAE recon/mu/logvar too)
-        endstate, score, recon, mu, logvar = self.policy.inference(depth, obs_b)
+        endstate, score, recon, mu, logvar = self.policy.inference(
+            depth, obs_b,
+            dyn_obs_tokens=dyn_tokens_for_net,
+            dyn_obs_mask=dyn_mask_for_net)
 
         # 3. post-process [B, V, H, 9] -> [B*V*H, 9]
         endstate_flat = endstate.permute(0, 2, 3, 1).reshape(self.batch_size * self.traj_num, 9)
