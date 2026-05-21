@@ -252,6 +252,11 @@ def main():
                     default=os.path.join(REACT_ROOT, "results", "ablation.csv"))
     args = ap.parse_args()
 
+    # The script does os.chdir(YOPO_DIR) at import time so any relative --out
+    # would land under YOPO/results/.  Resolve against REACT_ROOT explicitly.
+    if not os.path.isabs(args.out):
+        args.out = os.path.join(REACT_ROOT, args.out)
+
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
 
     selected = set(args.only.split(",")) if args.only else None

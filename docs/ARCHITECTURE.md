@@ -233,10 +233,24 @@ invocation produces a head-to-head table.  The five rows are additive:
 | D +DCA only      | on  | on  | 0.5 | 0.0 | 0.0 |
 | E full           | on  | on  | 0.5 | 3.0 | 0.5 |
 
-### 2 k-iter results (batch=16, lr=1.5e-4, seed=42)
+### Results (batch=16, lr=1.5e-4, seed=42)
 
-Tail-window means (last 200 steps).  `nan` means the row never produced
-dynamic batches.
+Tail-window means (last 10% of steps).  `nan` means the row never
+produced dynamic batches.  Full CSVs with `dyn_kino_tail`, `n_dyn`/
+`n_stat`, wall-clock under `results/`.
+
+**5 k-iter run** (`results/ablation_5k.csv`, ~13 min total):
+
+| Row | total | stat_traj | dyn_traj | dyn_dyn | reVAE |
+|---|---:|---:|---:|---:|---:|
+| A baseline-yopo | 3.84 | 3.50 | nan  | nan  | 0.00  |
+| B +reVAE         | 3.85 | 3.48 | nan  | nan  | 0.036 |
+| C +dyn/kino loss | 4.18 | 3.54 | 3.71 | **0.224** | 0.036 |
+| D +DCA only      | 4.09 | 3.55 | 3.72 | 0.00 | 0.035 |
+| E full           | 4.20 | 3.55 | 3.72 | **0.226** | 0.036 |
+
+**2 k-iter run** (`results/ablation.csv`, ~5 min total) -- same trend,
+included as a fast-iteration reproduction target:
 
 | Row | total | stat_traj | dyn_traj | dyn_dyn | reVAE |
 |---|---:|---:|---:|---:|---:|
@@ -246,32 +260,32 @@ dynamic batches.
 | D +DCA only      | 4.33 | 3.64 | 3.83 | 0.00 | 0.044 |
 | E full           | 4.43 | 3.64 | 3.83 | **0.22** | 0.045 |
 
-Full table (with `dyn_kino_tail`, `n_dyn`/`n_stat`, wall-clock) lives in
-`results/ablation.csv`.
+### Findings (consistent at 2 k and 5 k iter)
 
-### Findings
-
-1. **reVAE alone (B vs A) is a wash** at single-frame, 2 k iter:
-   ΔtotalΔ = -0.001, Δstat_traj = +0.001 — within noise.  reVAE only
-   pays off when the temporal forward (path a) actually consumes its
-   posterior across frames, which we don't yet do.
-2. **Dyn/kino loss (C vs B)** raises total loss (4.15 → 4.49) because of
-   the added penalty term, but introduces the only meaningful dynamic
-   collision signal (`dyn_dyn` ~0.23 vs `nan`).  This is the real
-   contribution of stage-3.1.
-3. **DCA without dyn-loss signal (D vs B)** is slightly worse on
-   `total` (4.33 vs 4.15) — extra parameters, no gradient direction
-   beyond shared static traj/score supervision.  Confirms DCA needs a
-   loss to learn anything.
-4. **DCA on top of dyn-loss (E vs C)** moves `dyn_dyn` from 0.23 to 0.22
-   and `total` is essentially unchanged.  Consistent with the stage-3.2
-   5 k-iter A/B (≈1 % gain).  DCA is not pulling its weight at current
-   dataset scale.
-5. `dyn_kino_tail` is 0 across every row that runs the kinodynamic
-   loss — the configured envelope (`v_max=8`, `a_max=10`, `j_max=30`)
-   is loose enough that one-waypoint predictions never trigger it.  The
-   loss is wired correctly but inactive at these defaults; the envelope
-   only becomes binding for multi-waypoint trajectories (path a).
+1. **reVAE alone (B vs A) is a wash** at single-frame: 5 k Δtotal =
+   +0.003, Δstat_traj = -0.014 — within noise.  reVAE only pays off
+   when the temporal forward (path a) consumes its posterior across
+   frames, which we don't yet do.
+2. **Dyn/kino loss (C vs B)** raises total loss (5 k: 3.85 → 4.18)
+   because of the added penalty term, but introduces the only
+   meaningful dynamic collision signal (`dyn_dyn` 0.224 vs `nan`).
+   This is the real contribution of stage-3.1.
+3. **DCA without dyn-loss signal (D vs B)** is marginally worse on
+   `total` (5 k: 4.09 vs 3.85) — extra parameters, no gradient
+   direction beyond shared static traj/score supervision.  Confirms
+   DCA needs a loss to learn anything.
+4. **DCA on top of dyn-loss (E vs C)** moves `dyn_dyn` from 0.224 to
+   0.226 at 5 k (and 0.23 → 0.22 at 2 k) — a ~1 % oscillation around
+   noise.  Consistent with the stage-3.2 5 k-iter A/B (≈1 % gain).
+   The gap does **not** widen at 5 k vs 2 k, so the side channel is
+   not just under-trained at 2 k — it really isn't pulling its weight
+   at current dataset scale.
+5. `dyn_kino_tail` is essentially 0 across every row that runs the
+   kinodynamic loss (0.0001 at 5 k, exact 0 at 2 k) — the configured
+   envelope (`v_max=8`, `a_max=10`, `j_max=30`) is loose enough that
+   one-waypoint predictions almost never trigger it.  The loss is
+   wired correctly but inactive at these defaults; the envelope only
+   becomes binding for multi-waypoint trajectories (path a).
 
 ### Implication for the paper
 
@@ -279,7 +293,9 @@ Full table (with `dyn_kino_tail`, `n_dyn`/`n_stat`, wall-clock) lives in
   signal with a small static-traj cost.
 - Stage-3.2 DCA is an architectural ablation row that documents "naive
   side channel of GT obstacle tokens does not help at this data scale".
-- Reproduction: `python scripts/run_stage4_ablation.py --steps 2000`.
+- Reproduction:
+  - 2 k (~5 min):  `python scripts/run_stage4_ablation.py --steps 2000`
+  - 5 k (~13 min): `python scripts/run_stage4_ablation.py --steps 5000 --out results/ablation_5k.csv`
 
 ## Build/run commands at a glance
 
