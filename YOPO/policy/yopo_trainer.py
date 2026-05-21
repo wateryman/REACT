@@ -62,6 +62,23 @@ class YopoTrainer:
                                            num_workers=4, pin_memory=True)
         self.val_dataloader = DataLoader(YOPODataset(mode='valid'), batch_size=self.batch_size, shuffle=False,
                                          num_workers=4, pin_memory=True)
+
+        # 🟧 stage-3.1 C.3: optional dynamic dataloader.  dynamic_ratio == 0 -->
+        # static-only training (regression-clean: dyn_obs is never passed and
+        # forward_and_compute_loss returns dyn = kino = 0 exactly, matching C.2 smoke).
+        self.dynamic_ratio = float(cfg["dynamic_ratio"])
+        if self.dynamic_ratio > 0.0:
+            from policy.yopo_dataset import DynamicYOPOWrapper
+            self.dyn_train_dataloader = DataLoader(
+                DynamicYOPOWrapper(mode='train'),
+                batch_size=self.batch_size, shuffle=True,
+                num_workers=2, pin_memory=True)
+            self.dyn_train_iter = iter(self.dyn_train_dataloader)
+            print(f"Dynamic dataloader enabled (ratio={self.dynamic_ratio:.2f}, "
+                  f"{len(self.dyn_train_dataloader.dataset)} seqs).")
+        else:
+            self.dyn_train_dataloader = None
+            self.dyn_train_iter = None
         print("Dataset Loaded!")
 
     def train(self, epoch, save_interval=None):
@@ -84,17 +101,35 @@ class YopoTrainer:
         inspect_interval = max(1, len(self.train_dataloader) // 16)
         traj_losses, score_losses, revae_losses, dyn_losses, kino_losses, smooth_losses, safety_losses, goal_losses, acc_losses, start_time = [], [], [], [], [], [], [], [], [], time.time()
         lam_vae = cfg["loss_weights"]["lam_vae"]
-        for step, (depth, pos, rot, obs_b, map_id) in enumerate(self.train_dataloader):  # obs: body frame
-            if depth.shape[0] != self.batch_size:  continue  # batch size == number of env
+        for step, static_batch in enumerate(self.train_dataloader):  # obs: body frame
+            if static_batch[0].shape[0] != self.batch_size:  continue  # batch size == number of env
+
+            # 🟧 stage-3.1 C.3: per-step swap to a dynamic batch with probability
+            # dynamic_ratio.  Static is always the "main loop" so that the total
+            # step count == number of static batches; we never train on more
+            # epochs of the (smaller) dynamic dataset than this implies.
+            dyn_obs_payload = None
+            if self.dyn_train_iter is not None and torch.rand(1).item() < self.dynamic_ratio:
+                try:
+                    dyn_batch = next(self.dyn_train_iter)
+                except StopIteration:
+                    self.dyn_train_iter = iter(self.dyn_train_dataloader)
+                    dyn_batch = next(self.dyn_train_iter)
+                if dyn_batch[0].shape[0] == self.batch_size:
+                    depth, pos, rot, obs_b, map_id, dyn_pad, dyn_mask = dyn_batch
+                    dyn_obs_payload = (dyn_pad, dyn_mask)
+                else:
+                    depth, pos, rot, obs_b, map_id = static_batch
+            else:
+                depth, pos, rot, obs_b, map_id = static_batch
 
             self.optimizer.zero_grad()
 
-            # 🟧 stage-3.1 C.2: 9-tuple includes dyn_loss + kino_loss.  dyn_obs is
-            # None here because the dataloader is the stage-1 static one; C.3
-            # introduces a mixed dataloader that fills dyn_obs.
+            # 🟧 stage-3.1: 9-tuple includes dyn_loss + kino_loss.  Both are 0 when
+            # dyn_obs_payload is None (static batch); positive when dynamic.
             (trajectory_loss, score_loss, revae_loss, dyn_loss, kino_loss,
              smooth_cost, safety_cost, goal_cost, acc_cost) = self.forward_and_compute_loss(
-                depth, pos, rot, obs_b, map_id)
+                depth, pos, rot, obs_b, map_id, dyn_obs=dyn_obs_payload)
 
             # dyn_loss and kino_loss are already lam-weighted by YOPOLoss wrappers.
             loss = (self.loss_weight[0] * trajectory_loss

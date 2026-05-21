@@ -283,6 +283,122 @@ class YOPODataset(Dataset):
         plt.show()
 
 
+class DynamicYOPOWrapper(YOPODataset):
+    """🟧 stage-3.1 C.3: wraps YOPODataset(dynamic=True) and re-shapes each
+    sample to a 7-tuple compatible with the static trainer call path:
+
+        (image, pos, rot_wb, random_obs, map_idx, dyn_pad, dyn_mask)
+
+    Where:
+        image       : (1, H, W) float32 in [0,1]   -- frame K-1 of the bake
+        pos         : (3,)     float32 world       -- drone pos at K-1
+        rot_wb      : (3, 3)   float32             -- world->body rotation
+                                                      (we re-use quat_wc;
+                                                      the baker uses 0 cam
+                                                      pitch so quat_wc == quat_wb)
+        random_obs  : (9,)     float32             -- vel(3) acc(3) goal(3) in body,
+                                                      sampled identically to
+                                                      the static path so the
+                                                      network sees the same
+                                                      training distribution
+        map_idx     : int                          -- random in [0, env_num) so
+                                                      YOPOLoss.safety_loss queries
+                                                      an in-range static ESDF.
+                                                      The static ESDF geometry
+                                                      differs from this dynamic
+                                                      sample's pointcloud; the
+                                                      safety contribution on
+                                                      dynamic batches is therefore
+                                                      noisy-but-bounded.  Real
+                                                      ESDF-against-dynamic-cloud
+                                                      is a stage-3.2+ refactor.
+        dyn_pad     : (M_max, 7) float32 world    -- [px,py,pz,vx,vy,vz,r]
+        dyn_mask    : (M_max,)   bool             -- True for real slots
+
+    Default DataLoader collate stacks everything correctly; no custom
+    collate_fn is needed.
+
+    On the loss side this means motion_reshaped_collision_loss sees real
+    obstacle (pos, vel) but a randomly-sampled drone velocity (via the
+    body->world transform of random_obs[0:3]).  Stage-3.1 (path c) is
+    "loss only, single-frame forward", so this distribution mix is
+    acceptable.  Stage-3.2 (path b, side-channel dyn-tokens) will replace
+    random_obs's velocity with the bake's true vel_world for a tighter
+    closing-speed signal.
+    """
+
+    def __init__(self, mode='train', val_ratio=0.1):
+        super().__init__(mode=mode, val_ratio=val_ratio, dynamic=True)
+        # The dynamic-mode super().__init__ early-returns before populating
+        # these static-mode sampling fields, so we re-bind them here.
+        self.vel_max = cfg["vel_max_train"]
+        self.acc_max = cfg["acc_max_train"]
+        self.vx_lognorm_mean = np.log(1 - cfg["vx_mean_unit"])
+        self.vx_logmorm_sigma = np.log(cfg["vx_std_unit"])
+        self.v_mean = np.array([cfg["vx_mean_unit"], cfg["vy_mean_unit"], cfg["vz_mean_unit"]])
+        self.v_std  = np.array([cfg["vx_std_unit"],  cfg["vy_std_unit"],  cfg["vz_std_unit"]])
+        self.a_mean = np.array([cfg["ax_mean_unit"], cfg["ay_mean_unit"], cfg["az_mean_unit"]])
+        self.a_std  = np.array([cfg["ax_std_unit"],  cfg["ay_std_unit"],  cfg["az_std_unit"]])
+        self.goal_length = cfg['goal_length']
+        self.goal_pitch_std = cfg["goal_pitch_std"]
+        self.goal_yaw_std   = cfg["goal_yaw_std"]
+        # C.3-specific
+        self.M_max = int(cfg["dynamic_attention"]["max_dyn_obs"])
+        # Discover static env count by globbing dataset_path (matches the
+        # behaviour of YOPODataset's static-mode init which auto-detects
+        # env_X subfolders).  Used to keep fake map_idx in-range for
+        # YOPOLoss.safety_loss.
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        static_data_dir = os.path.join(base_dir, "..", cfg["dataset_path"])
+        if os.path.isdir(static_data_dir):
+            self.env_num_static = max(1, sum(
+                1 for f in os.scandir(static_data_dir) if f.is_dir()))
+        else:
+            self.env_num_static = 1   # graceful fallback if static data not present
+
+    def __getitem__(self, idx):
+        sample = self._load_dynamic(idx)   # dict with depth_seq, state_seq, dyn_obs, dt_seq, meta
+
+        # Last frame of the K-frame sequence as the "current frame" the
+        # single-frame YopoNetwork.forward will consume.
+        depth_seq = sample["depth_seq"]    # (K, 1, H, W) float32 in [0, 1]
+        image = depth_seq[-1]              # (1, H, W)
+
+        st = sample["state_seq"][-1]
+        pos = np.array(st["pos"], dtype=np.float32)
+        quat_wc = st["quat_wc"]            # [w, x, y, z]
+        # scipy.spatial.Rotation.from_quat takes xyzw
+        R_WB = R.from_quat([quat_wc[1], quat_wc[2], quat_wc[3], quat_wc[0]])
+        rot_wb = R_WB.as_matrix().astype(np.float32)
+
+        # Random vel/acc/goal in body, matching static distribution.
+        vel_w, acc_w = self._get_random_state()
+        euler = R_WB.as_euler('ZYX', degrees=False)
+        # body-yaw-only inverse (matches YOPODataset.__getitem__)
+        R_Bw = R.from_euler('ZYX', [0, euler[1], euler[2]], degrees=False).inv()
+        vel_b = R_Bw.apply(vel_w)
+        acc_b = R_Bw.apply(acc_w)
+        goal_w = self._get_random_goal()
+        goal_b = R_Bw.apply(goal_w)
+        random_obs = np.hstack([vel_b, acc_b, goal_b]).astype(np.float32)
+
+        map_idx = int(np.random.randint(0, self.env_num_static))
+
+        # Pad dyn_obs[K-1] into (M_max, 7) + mask.
+        balls = sample["dyn_obs"][-1]
+        dyn_pad = np.zeros((self.M_max, 7), dtype=np.float32)
+        dyn_mask = np.zeros((self.M_max,), dtype=np.bool_)
+        n_use = min(len(balls), self.M_max)
+        for i in range(n_use):
+            b = balls[i]
+            dyn_pad[i, 0:3] = b["pos"]
+            dyn_pad[i, 3:6] = b["vel"]
+            dyn_pad[i, 6]   = b["radius"]
+            dyn_mask[i] = True
+
+        return image, pos, rot_wb, random_obs, map_idx, dyn_pad, dyn_mask
+
+
 if __name__ == '__main__':
     # plot the random sample
     dataset = YOPODataset()

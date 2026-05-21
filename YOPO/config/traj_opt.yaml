@@ -77,6 +77,11 @@ loss_weights:
   lam_dyn: 3.0           # 🟧 stage-3.1: motion_reshaped_collision_loss weight (highest per guide §3.6)
   lam_kino: 0.5          # 🟧 stage-3.1: kinodynamic_loss weight
 
+# 🟧 stage-3.1: max obstacle slots packed per batch (DynamicYOPOWrapper pads to this).
+# Stage-3.2 will also reuse this for DynamicCrossAttention's max_dyn_obs tokens.
+dynamic_attention:
+  max_dyn_obs: 8
+
 # 🟧 stage-3.1 dynamic-obstacle losses (only applied when batch has dyn_obs)
 motion_reshaped:
   alpha:  2.0            # closing-speed reshape gain; bigger -> bigger penalty for fast approaches
