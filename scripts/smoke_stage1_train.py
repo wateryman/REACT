@@ -36,7 +36,7 @@ def main():
     ap.add_argument("--lr", type=float, default=1.5e-4)
     args = ap.parse_args()
 
-    log_dir = os.path.join(YOPO_DIR, "saved")
+    log_dir = os.path.join(YOPO_DIR, "saved", "_scratch")
     os.makedirs(log_dir, exist_ok=True)
 
     print(f"== stage-1 smoke train | max_steps={args.max_steps} batch={args.batch} ==")
