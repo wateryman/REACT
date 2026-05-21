@@ -93,15 +93,31 @@ def project_yopo(p_world, drone_pos, drone_quat_wc, intr):
 def check_one_ball(depth, ball, drone_state, intr):
     """Try a single ball; return (status, u_exp, v_exp, d_cam, depth_at_pixel, err_z).
     status is one of: "PASS", "FAIL", "OUT_OF_VIEW", "OCCLUDED".
+
+    Expected front-surface depth (cam-frame x of the near hit on a ray
+    pointing at the ball center):
+        d_front_x = c.x * (1 - r / |c|)
+    where |c| is the Euclidean distance from camera to ball center.
+    On-axis (|c| = c.x) this collapses to c.x - r; off-axis the deduction
+    is smaller because the ray hits the sphere at a point with smaller
+    |x|/|distance| ratio.
     """
     u_exp, v_exp, d_cam = project_yopo(ball["pos"], drone_state["pos"],
                                         drone_state["quat_wc"], intr)
     if d_cam < 0.3 or not (0 <= u_exp < intr["W"]) or not (0 <= v_exp < intr["H"]):
         return ("OUT_OF_VIEW", u_exp, v_exp, d_cam, float("nan"), float("nan"))
+
+    # Recover camera-frame ball center from the projection result.
+    # u = -fx * c.y / c.x + cx  ->  c.y = -(u - cx) * c.x / fx
+    # v = -fy * c.z / c.x + cy  ->  c.z = -(v - cy) * c.x / fy
+    cy_cam = -(u_exp - intr["cx"]) * d_cam / intr["fx"]
+    cz_cam = -(v_exp - intr["cy"]) * d_cam / intr["fy"]
+    c_norm = (d_cam * d_cam + cy_cam * cy_cam + cz_cam * cz_cam) ** 0.5
+    d_front = d_cam * (1.0 - ball["radius"] / c_norm)
+
     u0 = int(round(u_exp))
     v0 = int(round(v_exp))
     depth_at = float(depth[v0, u0])
-    d_front = d_cam - ball["radius"]
     err_z = abs(depth_at - d_front)
     if depth_at < d_front - OCCLUSION_MARGIN_M:
         # Something closer than the ball's front surface lives at this pixel
@@ -167,14 +183,23 @@ def main(seq_dir):
 
         if frame_status == "PASS":
             u, v_, d_cam, d_at, err_z, cand = frame_record
+            # recompute d_front for logging consistency
+            cy_cam = -(u - intr["cx"]) * d_cam / intr["fx"]
+            cz_cam = -(v_ - intr["cy"]) * d_cam / intr["fy"]
+            c_norm = (d_cam * d_cam + cy_cam * cy_cam + cz_cam * cz_cam) ** 0.5
+            d_front = d_cam * (1.0 - cand["radius"] / c_norm)
             print(f"[PASS] frame {k:2d}: "
-                  f"u_exp={u:6.2f} v_exp={v_:5.2f} d_front_exp={d_cam - cand['radius']:5.2f}m  "
+                  f"u_exp={u:6.2f} v_exp={v_:5.2f} d_front_exp={d_front:5.2f}m  "
                   f"depth_at_pixel={d_at:5.2f}m  err={err_z:.3f}m (tol {TOL_DEPTH_M}m)")
             n_pass += 1
         elif frame_status == "FAIL":
             u, v_, d_cam, d_at, err_z, cand = frame_record
+            cy_cam = -(u - intr["cx"]) * d_cam / intr["fx"]
+            cz_cam = -(v_ - intr["cy"]) * d_cam / intr["fy"]
+            c_norm = (d_cam * d_cam + cy_cam * cy_cam + cz_cam * cz_cam) ** 0.5
+            d_front = d_cam * (1.0 - cand["radius"] / c_norm)
             print(f"[FAIL] frame {k:2d}: "
-                  f"u_exp={u:6.2f} v_exp={v_:5.2f} d_front_exp={d_cam - cand['radius']:5.2f}m  "
+                  f"u_exp={u:6.2f} v_exp={v_:5.2f} d_front_exp={d_front:5.2f}m  "
                   f"depth_at_pixel={d_at:5.2f}m  err={err_z:.3f}m  "
                   f"(should be ~d_front)")
             n_fail += 1
