@@ -1,0 +1,6 @@
+name,steps,wall_s,n_dyn,n_stat,total_head,total_tail,stat_traj_head,stat_traj_tail,dyn_traj_tail,dyn_dyn_head,dyn_dyn_tail,dyn_kino_tail,revae_tail
+A_baseline_yopo,5000,97.8,0,5000,4.9897,3.8432,4.1179,3.4984,nan,nan,nan,nan,0.0
+B_plus_reVAE,5000,132.8,0,5000,5.1702,3.8465,4.2141,3.4846,nan,nan,nan,nan,0.036
+C_plus_dyn_kino,5000,150.8,2440,2560,5.4886,4.1761,4.1211,3.5431,3.7056,0.2317,0.2243,0.0001,0.0364
+D_plus_DCA_no_loss,5000,155.4,2418,2582,5.455,4.0887,4.0593,3.5455,3.7159,0.0,0.0,0.0,0.0354
+E_full,5000,155.1,2418,2582,5.5804,4.1998,4.061,3.5511,3.7175,0.2336,0.2261,0.0001,0.0357

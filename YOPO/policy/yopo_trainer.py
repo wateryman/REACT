@@ -45,9 +45,16 @@ class YopoTrainer:
         # YopoNetwork(use_dca=False) matches stage-3.1 byte-for-byte.
         use_dca = bool(cfg["dynamic_attention"]["enable"])
         dca_n_heads = int(cfg["dynamic_attention"]["n_heads"])
-        self.policy = YopoNetwork(use_dca=use_dca, dca_n_heads=dca_n_heads)
+        # 🟧 stage-4: read revae.enable so the ablation can disable the
+        # auxiliary encoder for the original-YOPO baseline row.
+        use_revae = bool(cfg["revae"]["enable"])
+        self.policy = YopoNetwork(use_revae=use_revae,
+                                   revae_latent=int(cfg["revae"]["latent_dim"]),
+                                   use_dca=use_dca, dca_n_heads=dca_n_heads)
         if use_dca:
             print(f"DCA side channel: ENABLED (n_heads={dca_n_heads})")
+        if not use_revae:
+            print(f"reVAE: DISABLED (ablation mode)")
         self.policy = self.policy.to(self.device)
         try:
             state_dict = torch.load(checkpoint_path, weights_only=True)

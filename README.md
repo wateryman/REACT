@@ -59,8 +59,8 @@ bash scripts/preflight.sh
 | 2 — Dynamic dataset (D-3) | ✅ merged to `main`, tag `v0.2-cuda-dynamic` | CUDA raycaster gains `DynSphere` + `ray_sphere_depth`; `dataset_generator` dynamic mode bakes 500-seq production set; `verify_dynamic_render.py` go/no-go gate; `YOPODataset --dynamic` switch |
 | 3.1 — Dynamic loss (path c) | ✅ merged to `main`, tag `v0.3.1-loss-only` | `motion_reshaped_collision_loss` + `kinodynamic_loss`; YOPOLoss wrappers; trainer mixed sampling 50/50; 1k-iter 5/5 gates PASS (static traj 4.71->3.87, dyn 0.27->0.23) |
 | 3.2 — Side channel (path b) | ✅ merged to `main`, tag `v0.3.2-side-channel` | DynObsEncoder + DynamicCrossAttention wired into YopoNetwork.forward; trainer builds drone-relative tokens. **Architecture works but 5k-iter A/B shows only ~1% improvement over path c at current dataset size — see docs/ARCHITECTURE.md for the full analysis.** |
-| 3.4 — K-frame forward (path a) | ⏸ pending | Open question: invest in full temporal forward (highest ceiling, ~1 week) or pivot to ablation/deployment? |
-| 4 — Ablation | ⏸ pending | |
+| 3.4 — K-frame forward (path a) | ⏸ pending | Open question: invest in full temporal forward (highest ceiling, ~1 week) or pivot to deployment? |
+| 4 — Ablation | ✅ merged to `main`, tag `v0.4-ablation` | `scripts/run_stage4_ablation.py` runs 5 additive configs (A baseline → E full). 2k-iter table in `results/ablation.csv`. Headline: dyn/kino loss adds dyn-collision signal; DCA side-channel ~1% noise. See `docs/ARCHITECTURE.md` Stage-4 section |
 | 5 — Deployment | ⏸ pending | |
 
 ## Branch Strategy
@@ -72,7 +72,7 @@ bash scripts/preflight.sh
 | `stage-1-tooling` | epoch runner + tfevents extractor utilities |
 | `stage-2-cuda-dynamic` | YOPO CUDA raycaster dynamic-sphere extension + dynamic dataset baker (D-3) |
 | `stage-3-dynamic-upgrade` (planned) | dynamic-aware losses + temporal-aware forward (architecture TBD) |
-| `stage-4-ablation` (planned) | component ablations |
+| `stage-4-ablation` | component ablations (5-row table) — merged |
 | `stage-5-deploy` (planned) | on-board deployment |
 
 Each stage is developed on its own branch; merges to `main` are gated by review.
