@@ -22,19 +22,24 @@ REACT/
   Controller/             # ROS controller package (from YOPO, unchanged)
   Simulator/              # ROS simulator extended with dynamic-sphere ray-sphere
                           # intersection in the CUDA raycaster (stage-2 D-3)
-  YOPO/
+  YOPO/                   # name kept to mirror upstream YOPO's layout so
+                          # `git diff upstream` stays auditable; the *contents*
+                          # are REACT's network/loss/dataset code (see docs/ARCHITECTURE.md)
     train_yopo.py         # training entry (extended in stage-1 with reVAE loss)
     policy/               # network backbones, dataset, trainer
     loss/                 # smoothness / safety / goal (YOPO original) + REACT losses
-    config/               # YAML configs (config.yaml static + config_dynamic.yaml)
+    config/               # YAML configs (traj_opt.yaml static + config used for the simulator)
   scripts/
     preflight.sh          # environment self-check (run this first every session)
     smoke_stage1_*.py     # stage-1 module + integration + 100-iter training smoke
+    smoke_stage2_2e.py    # stage-2 YOPODataset dynamic-mode smoke + static regression
     run_one_epoch.py      # epoch runner used to validate stage-1 baseline
     extract_tb.py         # tensorboard scalar -> ASCII sparkline summary
   tools/
     verify_dynamic_render.py  # stage-2 geometric verification gate (D-3)
   docs/
+    ARCHITECTURE.md       # three-package layout + data flow + module map
+    dyn_sample_*.png      # sample depth-image visualizations
 ```
 
 ## Quick Start
