@@ -18,17 +18,10 @@ encoded from info["dyn_obs"].
 import torch
 import torch.nn as nn
 
-
-class DynamicCrossAttention(nn.Module):
-    def __init__(self, hidden: int, n_heads: int = 4):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(hidden, num_heads=n_heads, batch_first=True)
-        self.norm = nn.LayerNorm(hidden)
-
-    def forward(self, q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
-        # q: (B, 1, hidden); kv: (B, M, hidden)
-        out, _ = self.attn(q, kv, kv)
-        return self.norm(q + out)
+# 🟧 stage-3.2: DynamicCrossAttention lives in policy.models.dynamic_attention
+# (one file for all dyn-obs side-channel primitives).  Re-imported here so
+# the stage-1 GRUDecoder constructor below continues to work unchanged.
+from policy.models.dynamic_attention import DynamicCrossAttention  # noqa: F401
 
 
 class GRUDecoder(nn.Module):
