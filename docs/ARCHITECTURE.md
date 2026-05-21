@@ -152,28 +152,72 @@ tools/                              (REACT tooling, all 🟧/🟦)
 docs/                               docs + viz samples
 ```
 
-## "Unwired" modules
+## Path-c (stage-3.1) and path-b (stage-3.2): empirical findings
 
-Stage 1's `FrameBuffer`, `TemporalRegionSelector`, and `GRUDecoder` are on
-disk and unit-tested, but `YopoNetwork.forward(depth, obs)` is still a
-single-frame anchor-grid pipeline. Stage 3 will choose how to wire them:
+The original "unwired modules" plan offered three paths to wiring the
+dynamic-obstacle channel into the forward graph (c: loss-only;
+b: side-channel tokens; a: full K-frame).  Paths c and b are now both
+implemented and on `main`; here is the verdict.
 
-- **(c) loss-only**: just add `motion_reshaped_collision_loss` +
-  `kinodynamic_loss` to the total; forward stays single-frame. Cheapest;
-  network can only react to current-frame ball positions (reactive
-  avoidance only). Expected dynamic success rate: 50-70%.
-- **(b) dyn-obs side-channel**: `forward(depth, obs, dyn_obs_tokens=None)`
-  with `dyn_obs_tokens` encoded from `dyn_obs.json` (training) or a runtime
-  detector (deployment). DynamicCrossAttention injects the tokens before the
-  head. Anchor grid head stays. Expected: 75-85%.
-- **(a) full K-frame forward**: `forward(depth_seq, ...)` running ReVAE per
-  frame, feeding Selector + GRUDecoder + DynamicCrossAttention. Head
-  rebuilt around `n_anchors` flat. Maximum capacity; head no longer V×H
-  grid. Expected: 80-90% but ~1 week of refactor.
+### Stage-3.1 (path c, `v0.3.1-loss-only`)
 
-Pick decided when stage-3 opens, with stage-2's 1800 in-view-ball frames as
-the data backing. See the project guide §6.1 stage-3 for the smoke tests
-that any choice has to pass.
+`motion_reshaped_collision_loss` and `kinodynamic_loss` were added to
+the YOPOLoss class as standalone weighted terms; `forward` was not
+changed.  Mixed-sampling (50% static / 50% dynamic) plus the new losses
+were validated by `scripts/run_stage3_1k.py` — all five 過関 gates clear.
+
+### Stage-3.2 (path b, `v0.3.2-side-channel`)
+
+`YopoNetwork.forward` gained an optional `dyn_obs_tokens` / `dyn_obs_mask`
+pair.  When `cfg.dynamic_attention.enable=true` the network instantiates
+`DynObsEncoder` (7 -> 201 dim MLP) and `DynamicCrossAttention` (n_heads=1
+because head_in=201 is not divisible by 4).  The trainer builds tokens
+from the baked dyn_obs payload as `[rel_pos, abs_vel, radius]` where
+`rel_pos = obs_pos - drone_pos` (world-frame, no yaw rotation).
+
+### 5k-iter A/B comparison (DCA off vs DCA on, same dataset, same lr, batch=16)
+
+| Metric              | path c (DCA off) | path b (DCA on) | Delta |
+|---------------------|------------------|-----------------|-------|
+| total head -> tail  | 5.52 -> 4.20     | 5.52 -> 4.17    | -0.03 (0.8%)  |
+| static traj head -> tail | 4.13 -> 3.55 | 4.27 -> 3.49   | -0.05 (1.5%)  |
+| **dyn dyn head -> tail** | **0.236 -> 0.225** | **0.239 -> 0.223** | **-0.002 (0.9%)** |
+
+DCA gives a ~1% marginal improvement on dynamic loss at this training scale —
+below noise.  The architectural plumbing works (sub-A through sub-D smoke
+tests all green; DCA fires exactly when `dyn_obs_tokens` is supplied,
+gradient flows back to tokens), but the **side channel is not yet pulling
+its weight** at our current dataset size (450 train sequences, 50%
+sampling -> ~225 dynamic batches per epoch effectively).
+
+### Hypotheses for the lack of separation, ranked by likelihood
+
+1. **Dataset starvation.** DCA parameters (205 K) only receive gradient
+   on dynamic batches; that's ~50 % of training steps.  In 5 k iter the
+   DCA layers see ~2.5 k effective updates from random init -- not enough
+   to learn obstacle-attention patterns.
+2. **Token redundancy with depth.** The depth image already encodes
+   obstacle locations.  Adding the same info via tokens may be redundant
+   unless the network can decode "this is the same ball" cross-frame, which
+   stage-3.2 single-frame forward cannot do.
+3. **World-frame tokens without yaw rotation.** Network has to learn the
+   yaw transform implicitly; trainable but burns capacity.
+4. **Static safety_loss pollution.** Dynamic batches use a random static
+   `map_idx` so YOPOLoss.safety_loss queries an ESDF that doesn't match
+   the actual dynamic scene; this is a deliberate stage-3.1 shortcut but
+   may be noising up the gradient signal.
+
+### Decision: ship stage-3.2 as-is, document negative result, do not invest more here
+
+The architecture is correct and reusable.  Future work that wants to test
+"path-b really helps" should first address (1) by 4-8× more dynamic data,
+or pivot to **path a (full K-frame forward)** which has a much higher
+theoretical ceiling because the network can learn obstacle motion from
+the depth sequence directly.
+
+In the paper, stage-3.1 is the headline architecture; stage-3.2 sits as
+an ablation table row showing "explicit GT token side channel adds <1%
+at this scale".
 
 ## Build/run commands at a glance
 

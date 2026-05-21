@@ -56,8 +56,10 @@ bash scripts/preflight.sh
 | Stage | State | What landed |
 |---|---|---|
 | 1 — PEMTRS port | ✅ merged to `main`, tag `v0.1-pemtrs-port` | ReVAE wired into YopoNetwork as auxiliary encoder; reVAE loss in trainer; 100-iter gate PASS; 1-epoch eval err parity with train |
-| 2 — Dynamic dataset (D-3) | 🚧 in progress on `stage-2-cuda-dynamic` | 2.a ✅ CUDA raycaster `DynSphere` + `ray_sphere_depth` + test (3/3 PASS); 2.b ✅ `dataset_generator` dynamic mode + `config_dynamic.yaml`; 2.c ✅ `verify_dynamic_render.py` gate cleared; 2.d ⏸ full 500-episode bake; 2.e ⏸ `policy/yopo_dataset.py` `--dynamic` switch |
-| 3 — Dynamic loss + upgrades | ⏸ pending | Architecture choice (loss-only / dyn-obs side channel / full K-frame forward) deferred until 2.d data is in hand |
+| 2 — Dynamic dataset (D-3) | ✅ merged to `main`, tag `v0.2-cuda-dynamic` | CUDA raycaster gains `DynSphere` + `ray_sphere_depth`; `dataset_generator` dynamic mode bakes 500-seq production set; `verify_dynamic_render.py` go/no-go gate; `YOPODataset --dynamic` switch |
+| 3.1 — Dynamic loss (path c) | ✅ merged to `main`, tag `v0.3.1-loss-only` | `motion_reshaped_collision_loss` + `kinodynamic_loss`; YOPOLoss wrappers; trainer mixed sampling 50/50; 1k-iter 5/5 gates PASS (static traj 4.71->3.87, dyn 0.27->0.23) |
+| 3.2 — Side channel (path b) | ✅ merged to `main`, tag `v0.3.2-side-channel` | DynObsEncoder + DynamicCrossAttention wired into YopoNetwork.forward; trainer builds drone-relative tokens. **Architecture works but 5k-iter A/B shows only ~1% improvement over path c at current dataset size — see docs/ARCHITECTURE.md for the full analysis.** |
+| 3.4 — K-frame forward (path a) | ⏸ pending | Open question: invest in full temporal forward (highest ceiling, ~1 week) or pivot to ablation/deployment? |
 | 4 — Ablation | ⏸ pending | |
 | 5 — Deployment | ⏸ pending | |
 
