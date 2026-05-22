@@ -4,14 +4,14 @@
 每个 `.tex` 文件**自包含**(自带 preamble),可以单独 `pdflatex` 编译,也可以
 直接在 GitHub 上阅读 source。
 
-## 文件清单
+## 文件清单(英文 + 中文双版本)
 
 | 文件 | 内容 | 写作时机 |
 |---|---|---|
-| [01_collision_loss_saturation.tex](01_collision_loss_saturation.tex) | 为什么当前 motion_reshaped_collision_loss 在 single-frame anchor 形态下饱和(stage-3.6 v3 的 ~1% 天花板的数学解释) | stage-3.6 后 |
-| [02_multi_waypoint_extension.tex](02_multi_waypoint_extension.tex) | Option B(多 waypoint GRU decoder)如何把损失从 per-anchor 推广到 per-waypoint;kinodynamic 损失为何在多 waypoint 下"真正激活" | stage-3.6 后 |
-| [03_esdf_time_replacement.tex](03_esdf_time_replacement.tex) | 把 stage-3.1 `random map_idx` 捷径换成真实动态场景 ESDF 的推导;时空 ESDF 的梯度 | stage-3.6 后 |
-| [04_stage5_deployment_math.tex](04_stage5_deployment_math.tex) | <10 ms 推理延迟预算分解;K=10 stateless vs stateful GRU 的延迟数学;≥85% 成功率与 dyn_dyn 的(假设)关系 | stage-3.6 后 |
+| [01_collision_loss_saturation.tex](01_collision_loss_saturation.tex) / [01_collision_loss_saturation_cn.tex](01_collision_loss_saturation_cn.tex) | 为什么当前 motion_reshaped_collision_loss 在 single-frame anchor 形态下饱和(stage-3.6 v3 的 ~1% 天花板的数学解释) | stage-3.6 后 |
+| [02_multi_waypoint_extension.tex](02_multi_waypoint_extension.tex) / [02_multi_waypoint_extension_cn.tex](02_multi_waypoint_extension_cn.tex) | Option B(多 waypoint GRU decoder)如何把损失从 per-anchor 推广到 per-waypoint;kinodynamic 损失为何在多 waypoint 下"真正激活" | stage-3.6 后 |
+| [03_esdf_time_replacement.tex](03_esdf_time_replacement.tex) / [03_esdf_time_replacement_cn.tex](03_esdf_time_replacement_cn.tex) | 把 stage-3.1 `random map_idx` 捷径换成真实动态场景 ESDF 的推导;时空 ESDF 的梯度 | stage-3.6 后 |
+| [04_stage5_deployment_math.tex](04_stage5_deployment_math.tex) / [04_stage5_deployment_math_cn.tex](04_stage5_deployment_math_cn.tex) | <10 ms 推理延迟预算分解;K=10 stateless vs stateful GRU 的延迟数学;≥85% 成功率与 dyn_dyn 的(假设)关系 | stage-3.6 后 |
 
 ## 引用规范
 
@@ -29,5 +29,11 @@ pdflatex 01_collision_loss_saturation.tex   # 单文件
 for f in *.tex; do pdflatex "$f"; done
 ```
 
-LaTeX 依赖: `amsmath`, `amssymb`, `bm`, `algorithm`, `algorithmic`, `hyperref`,
-`geometry`(标准 TeX Live full install 都自带)。
+LaTeX 依赖:
+- 英文版:`amsmath`, `amssymb`, `bm`, `hyperref`, `geometry`(TeX Live full 都自带)
+- 中文版:**额外需要 `ctex` 宏包**(`apt install texlive-lang-chinese`
+  或 `apt install texlive-full`),并用 `xelatex` 编译以正确处理中文字体:
+
+```bash
+xelatex 01_collision_loss_saturation_cn.tex
+```

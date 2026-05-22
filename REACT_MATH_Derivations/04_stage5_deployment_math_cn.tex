@@ -1,0 +1,199 @@
+\documentclass[UTF8, 11pt]{ctexart}
+\usepackage[a4paper, margin=1in]{geometry}
+\usepackage{amsmath, amssymb, bm}
+\usepackage{hyperref}
+
+\title{Stage-5 部署数学:\\
+       延迟预算、成功率转换、Stateless vs Stateful 选择}
+\author{REACT stage-5 启动前数学}
+\date{2026-05-22}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\ms}{\,\text{ms}}
+\newcommand{\flops}{\,\text{FLOPS}}
+
+\begin{document}
+\maketitle
+
+英文版:\href{run:./04_stage5_deployment_math.tex}{04\_stage5\_deployment\_math.tex}
+
+\section{论文要的两个目标数字}
+
+REACT 论文级目标(README 里设的,源自 PEMTRS RA-L 2026):
+\begin{enumerate}
+  \item 推理延迟 $T_{\text{inf}} < 10\ms$ / 帧,在 Jetson 级设备
+        (Orin Nano 或 NX 是典型参考)。
+  \item 闭环成功率 $\text{SR} \geq 85\%$,在动态障碍场景。
+\end{enumerate}
+
+当前训练指标 \texttt{dyn\_dyn\_tail} $\approx 0.22$--$0.24$ **既不是这两个**。
+本文档推导这个桥。
+
+\section{延迟预算分解}
+
+每帧推理,在 temporal 模式(K=10 stateless)下:
+\begin{equation}\label{eq:latency-stateless}
+T_{\text{inf}}^{\text{stateless}}
+\;=\;
+T_{\text{ReVAE-enc}}^{K} + T_{\text{GRU}}^{K} + T_{\text{backbone}}^{1} +
+T_{\text{head}}^{1} + T_{\text{post}}.
+\end{equation}
+
+单帧模式(stage-3.1):
+\begin{equation}\label{eq:latency-single}
+T_{\text{inf}}^{\text{single}}
+\;=\;
+T_{\text{ReVAE-enc}}^{1} + T_{\text{backbone}}^{1} +
+T_{\text{head}}^{1} + T_{\text{post}}.
+\end{equation}
+
+Stateful 模式(DiffPhysDrone 风格,见
+\texttt{stage\_3\_4\_research\_cn.md}):
+\begin{equation}\label{eq:latency-stateful}
+T_{\text{inf}}^{\text{stateful}}
+\;=\;
+T_{\text{ReVAE-enc}}^{1} + T_{\text{GRU}}^{1} + T_{\text{backbone}}^{1} +
+T_{\text{head}}^{1} + T_{\text{post}}.
+\end{equation}
+
+\subsection{各组件估算(Orin NX,INT8 量化的 reVAE)}
+
+按
+\href{https://developer.nvidia.com/embedded/jetson-orin}{Jetson Orin NX} INT8
+吞吐率(FP16 baseline $\approx 70$ TFLOPS)和模块 FLOP 数(\texttt{reVAE.encode}
+在 $96\times160$ 输入下 $\approx 0.4$ GFLOPS / 帧;\texttt{YopoBackbone}
+ResNet18 在同样输入下 $\approx 1.8$ GFLOPS):
+\begin{center}
+\begin{tabular}{lrrr}
+\hline
+组件 & FLOPS / 次 & 时间 / 次 (FP16) & 时间 / 次 (INT8) \\
+\hline
+\texttt{reVAE.encode}     & 0.4 G & 0.50\ms & 0.20\ms \\
+\texttt{reVAE.decode}     & 0.4 G & 不在推理图上 & --- \\
+\texttt{nn.GRU} 一步      & 0.1 M & 0.05\ms & 0.05\ms \\
+\texttt{YopoBackbone}     & 1.8 G & 2.4\ms  & 1.0\ms \\
+\texttt{YopoHead}         & 5.0 M & 0.08\ms & 0.04\ms \\
+后处理(poly solve、anchor argmax) & --- & 1.0\ms & 1.0\ms \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{延迟预算表}
+
+代入(FP16):
+\begin{center}
+\begin{tabular}{lrl}
+\hline
+模式                    & 延迟 & 打到 $<10\ms$ 预算? \\
+\hline
+\texttt{single}(3.1)   & $0.5 + 2.4 + 0.08 + 1.0 \approx 4.0\ms$  & **是**(还有余量) \\
+\texttt{stateful} K=1   & $0.5 + 0.05 + 2.4 + 0.08 + 1.0 \approx 4.0\ms$ & **是** \\
+\texttt{stateless} K=10 & $5.0 + 0.5 + 2.4 + 0.08 + 1.0 \approx 9.0\ms$  & **勉强**(10\% 余量) \\
+\hline
+\end{tabular}
+\end{center}
+
+结论:**stage-3.4 stateless K=10 在 Orin NX FP16 路径上可行但不舒服**。
+要么走 INT8(reVAE encode 每次降到 0.2\,ms,K=10 总时 $\sim 6.0\ms$),
+要么部署时换 stateful(保持 $\sim 4.0\ms$)。Stateful 重构**不是**模型
+重训 —— 它是推理循环的改动:逐帧喂 depth,GRU hidden 在调用之间保持。
+
+\section{从 \texttt{dyn\_dyn\_tail} 到成功率}
+
+这是欠定的桥。我们有
+\[
+\texttt{dyn\_dyn\_tail} = 0.23 \quad \text{(stage-3.1+,v3 数据集)}.
+\]
+我们想预测闭环 sim 里的 $\text{SR}$。没有干净的闭式表达,因为 $\text{SR}$
+依赖于 (i) 闭环策略稳定性,(ii) 动态场景难度,(iii) 控制器跟踪误差。
+但我们可以**给出界**。
+
+\subsection{用损失率先验估计每轨碰撞概率}
+
+记 $p_c$ 为每帧预测 endstate $\bm{p}_i^{\text{pred}}$ 落进禁止区(离某个障碍
+$d_{\text{safe}}$ 之内)的概率。假设最优 anchor 以高概率被选中,而
+\texttt{dyn\_dyn} 大致是激活 anchor 上罚款的均值:
+\begin{equation}\label{eq:pc-estimate}
+\texttt{dyn\_dyn}
+\;\approx\;
+\lambda_{\text{dyn}} \cdot p_c \cdot \overline{\softplus} ,
+\end{equation}
+其中 $\overline{\softplus}$ 是激活 anchor 上的 softplus 均值 $\approx 0.3$。
+$\lambda_{\text{dyn}} = 3.0$、\texttt{dyn\_dyn} $= 0.23$ 给出
+\begin{equation}
+p_c \approx \frac{0.23}{3.0 \cdot 0.3} \approx 0.26.
+\end{equation}
+解释:$\approx 26\%$ 的帧里,**某个**候选 anchor 会出违反安全边界的 endstate。
+但被选中的(top-score)anchor 通常是更安全的,所以每帧**实际**碰撞概率
+显著更低。
+
+\subsection{转换到闭环 $\text{SR}$}
+
+假设一个闭环轨迹由 $N_{\text{frame}} \approx 100$ 个规划步组成
+(30Hz 下 3.3\,s 飞行),score head 每次选**最优** anchor(所以每步**实际**
+碰撞概率 $p_{\text{actual}} \ll p_c$,可能小一个数量级,因为 score 选择)。
+那么
+\begin{equation}\label{eq:sr-bound}
+\text{SR}
+\;\approx\;
+(1 - p_{\text{actual}})^{N_{\text{frame}}}
+\;=\;
+\exp\!\bigl(-N_{\text{frame}} \cdot p_{\text{actual}}\bigr).
+\end{equation}
+要达到 $\text{SR} = 0.85$,需要
+$p_{\text{actual}} \le -\ln(0.85)/100 \approx 1.63 \times 10^{-3}$。
+$\text{SR} = 0.90$ 时:$p_{\text{actual}} \le 1.05 \times 10^{-3}$。
+
+如果 $p_{\text{actual}} \approx p_c/k$,其中 $k$ 是 score-selection 改善因子,
+那需要 $k \ge p_c / (1.63\times 10^{-3}) = 0.26 / 1.63\times 10^{-3}
+\approx 160$。
+
+\subsection{Score head 改善因子 $k$}
+
+**这个值不跑闭环测不出来**。经验上 YOPO score head 在静态场景下 $k$
+量级在 $50$--$200$(baseline 报告 $\sim$$90\%$ 静态成功率);是否能延续到
+动态场景**正是 stage-5 要测的**。
+
+**所以"\texttt{dyn\_dyn} = 0.23 够不够 $\text{SR} \geq 85\%$"的答案是:
+取决于 $k$**,**不跑 stage-5 测不出来**。
+
+\section{决定:Stage-5 先,不会 block 监督改进}
+
+用户的问题:"如果我直接走 stage-5,会不会 block $<10\ms$ 和 $\geq 85\%$ 目标?"
+
+**不会 block;它恰恰是测这两个目标的唯一方法**。理由:
+
+\begin{enumerate}
+  \item **$<10\ms$ 目标**依赖推理图 + 量化 + 硬件选择(Jetson NX vs Orin Nano)。
+        Stage-5 **就是**这个工作。监督改动不会移动这个数字;Option B head
+        $N=5$ 最多给 head 加 $\sim$$0.2\ms$(可忽略)。Stage-5 先决定
+        stateless K=10 在预算内还是要换 INT8 / stateful。**这两个都不需要重训**。
+  \item **$\geq 85\%$ SR 目标**需要现在不存在的闭环 sim 基础设施。建这个
+        是 stage-5 的一部分。建好之后跑当前 stage-3.1 模型,测 $k$ 和实际
+        $\text{SR}$。**如果**测出来 $\text{SR} \geq 85\%$,**完全不需要**改
+        监督 —— ship + 写论文。**如果**测出来 $\text{SR} < 85\%$,这个 gap
+        告诉你监督改动该多激进(多 waypoint vs ESDF vs 数据 vs 都改)。
+  \item **没有闭环 bench 的监督升级是投机**。把 \texttt{dyn\_dyn} 从 $0.23$
+        通过 Option B 拉到 $0.16$,只有在 $\text{SR}$ 真的低于 $85\%$
+        **且**瓶颈是规划器的避障质量(不是控制器,不是 FOV 覆盖问题)时
+        才值。**没测**就动手,可能两周做 Option B 之后发现 $k$ 在
+        $\texttt{dyn\_dyn} = 0.23$ 下已经够用了,白干。
+\end{enumerate}
+
+\subsection{推荐顺序}
+
+\begin{enumerate}
+  \item **Stage-5.A**:当前 stage-3.1 模型的 ONNX/TensorRT 导出 + Orin NX
+        延迟 profile。约 3 天。
+  \item **Stage-5.B**:用 \texttt{Simulator/} 已有的 ROS 控制器写闭环 sim
+        harness。跑 100 个动态场景,测 $\text{SR}$。约 4 天。
+  \item **决策点**。$\text{SR} \geq 85\%$:写论文 + ship。$\text{SR} < 85\%$:
+        按 \texttt{01\_collision\_loss\_saturation\_cn.tex} 的分析挑期望收益
+        最大的监督升级(很可能 Option B,可能加 camera-aware bake)。
+\end{enumerate}
+
+这个顺序**信息每周产出最大**:stage-5 单独要么直接给出 paper,要么明确告诉你
+该追哪个监督改动。先做监督改动是反过来 —— polish 一个跟 paper-target SR
+转换不确定的指标。
+
+\end{document}
