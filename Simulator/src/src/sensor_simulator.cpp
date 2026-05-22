@@ -6,6 +6,20 @@ cv::Mat SensorSimulator::renderDepthImage(){
     Eigen::Matrix3f R_wc = quat.toRotationMatrix();
     Eigen::Matrix3f R_cw = R_wc.inverse();
 
+    // 🟦 stage-5.B: snapshot dyn_spheres_ in camera frame.  Done once per
+    // call (not per pixel) so the per-pixel sphere test is a fast scan.
+    std::vector<DynSphereCPU> spheres_cam;
+    {
+        std::lock_guard<std::mutex> g(dyn_mtx_);
+        spheres_cam.reserve(dyn_spheres_.size());
+        for (const auto &s : dyn_spheres_) {
+            DynSphereCPU sc;
+            sc.pos    = R_cw * (s.pos - pos);
+            sc.radius = s.radius;
+            spheres_cam.push_back(sc);
+        }
+    }
+
     auto start = std::chrono::high_resolution_clock::now();
 #pragma omp parallel for
     for (int v = 0; v < image_height; ++v) {
@@ -21,6 +35,7 @@ cv::Mat SensorSimulator::renderDepthImage(){
             Eigen::Vector3f ray_direction = R_wc * d;  // 考虑相机旋转
             Eigen::Vector3f ray_origin = pos;         // 相机的位置
 
+            float depth_static = std::numeric_limits<float>::max();
             // 使用Octree查找射线方向上最近的点
             std::vector<int> pointIdxVec;
             if (octree->getIntersectedVoxelIndices(ray_origin, ray_direction, pointIdxVec, 1)) {
@@ -30,8 +45,36 @@ cv::Mat SensorSimulator::renderDepthImage(){
                 float distance = closest_point_camera(0);
                 if (distance < 0) distance = 0;
                 if (distance > max_depth_dist) distance = max_depth_dist;
-                if (normalize_depth) distance = distance / max_depth_dist;
-                depth_image.at<float>(v, u) = distance;
+                depth_static = distance;
+            }
+
+            // 🟦 stage-5.B: CPU ray-sphere intersection.  Mirrors the CUDA
+            // ray_sphere_depth() in sensor_simulator.cu.  d is the unit ray
+            // in CAMERA frame; sphere centres are stored in camera frame in
+            // spheres_cam.  Returns +X distance (matching the static depth
+            // convention).  Take min with the static depth.
+            float depth_dyn = std::numeric_limits<float>::max();
+            for (const auto &sc : spheres_cam) {
+                // |t * d - c|^2 = r^2  =>  t^2 - 2 t (d.c) + (|c|^2 - r^2) = 0
+                float b  = d.dot(sc.pos);
+                float c2 = sc.pos.squaredNorm() - sc.radius * sc.radius;
+                float disc = b * b - c2;
+                if (disc < 0.0f) continue;                 // no hit
+                float t = b - std::sqrt(disc);             // front face
+                if (t <= 0.0f) continue;                   // behind / inside
+                // d is unit; the depth-convention here is +X coord in camera
+                // frame, i.e. t * d.x() (camera looks down +X by line 16
+                // above).  Match the static-depth distance = closest_point_camera(0).
+                float depth_t = t * d.x();
+                if (depth_t < 0.0f) continue;
+                if (depth_t < depth_dyn) depth_dyn = depth_t;
+            }
+
+            float depth = std::min(depth_static, depth_dyn);
+            if (depth < std::numeric_limits<float>::max()) {
+                if (depth > max_depth_dist) depth = max_depth_dist;
+                if (normalize_depth) depth = depth / max_depth_dist;
+                depth_image.at<float>(v, u) = depth;
             }
         }
     }
@@ -169,4 +212,21 @@ void SensorSimulator::odomCallback(const nav_msgs::Odometry::ConstPtr& msg) {
     pos.z() = msg->pose.pose.position.z;
 
     odom_init = true;
+}
+
+// 🟦 stage-5.B: receive a PoseArray where each Pose's position holds the
+// ball world-frame xyz and orientation.w holds the radius (orientation.x/y/z
+// reserved for future per-ball velocity).  An empty PoseArray clears the
+// dynamic set, which is how scenarios get reset between runs.
+void SensorSimulator::dynObsCallback(const geometry_msgs::PoseArray::ConstPtr& msg) {
+    std::vector<DynSphereCPU> next;
+    next.reserve(msg->poses.size());
+    for (const auto &p : msg->poses) {
+        DynSphereCPU s;
+        s.pos    = Eigen::Vector3f(p.position.x, p.position.y, p.position.z);
+        s.radius = static_cast<float>(p.orientation.w);
+        if (s.radius > 0.0f) next.push_back(s);
+    }
+    std::lock_guard<std::mutex> g(dyn_mtx_);
+    dyn_spheres_.swap(next);
 }

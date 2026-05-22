@@ -12,14 +12,25 @@
 #include <ros/ros.h>
 #include <nav_msgs/Odometry.h>
 #include <sensor_msgs/Image.h>
+#include <geometry_msgs/PoseArray.h>
 #include <pcl_ros/point_cloud.h>
 #include <cv_bridge/cv_bridge.h>
 #include <iostream>
 #include <vector>
+#include <mutex>
 #include <chrono>
 #include <omp.h>
 #include <yaml-cpp/yaml.h>
 #include "maps.hpp"
+
+// 🟦 stage-5.B: CPU-side dynamic sphere mirror of the CUDA-only DynSphere
+// defined in sensor_simulator.cuh.  The ROS node owns a vector of these
+// updated by /sim/dyn_obs PoseArray subscriber, and renderDepthImage()
+// folds them into the per-pixel depth via CPU ray-sphere intersection.
+struct DynSphereCPU {
+    Eigen::Vector3f pos;     // world frame
+    float           radius;  // metres
+};
 
 class SensorSimulator {
 public:
@@ -113,6 +124,12 @@ public:
         image_pub_ = nh_.advertise<sensor_msgs::Image>(depth_topic, 1);
         point_cloud_pub_ = nh_.advertise<sensor_msgs::PointCloud2>(lidar_topic, 1);
         odom_sub_ = nh_.subscribe(odom_topic, 1, &SensorSimulator::odomCallback, this, ros::TransportHints().tcpNoDelay());
+        // 🟦 stage-5.B: dynamic obstacle subscriber.  Topic carries a
+        // geometry_msgs::PoseArray where each Pose's .position is the ball's
+        // world-frame position and .orientation.w is the ball's radius (hack
+        // to avoid defining a custom .msg).  .orientation.{x,y,z} reserved
+        // for future per-ball velocity (currently unused at the renderer).
+        dyn_obs_sub_ = nh_.subscribe("/sim/dyn_obs", 1, &SensorSimulator::dynObsCallback, this);
         timer_depth_ = nh_.createTimer(ros::Duration(1 / depth_fps), &SensorSimulator::timerDepthCallback, this);
         timer_lidar_ = nh_.createTimer(ros::Duration(1 / lidar_fps), &SensorSimulator::timerLidarCallback, this);
         printf("3.Simulation Ready! \n");
@@ -120,6 +137,7 @@ public:
     }
 
     void odomCallback(const nav_msgs::Odometry::ConstPtr &msg);
+    void dynObsCallback(const geometry_msgs::PoseArray::ConstPtr &msg);
 
     cv::Mat renderDepthImage();
 
@@ -162,7 +180,13 @@ private:
     ros::NodeHandle nh_;
     ros::Publisher image_pub_, point_cloud_pub_;
     ros::Subscriber odom_sub_;
+    ros::Subscriber dyn_obs_sub_;             // 🟦 stage-5.B
     ros::Timer timer_depth_, timer_lidar_;
+
+    // 🟦 stage-5.B: dynamic spheres, populated by dynObsCallback().
+    // renderDepthImage() locks dyn_mtx_ briefly to take a snapshot.
+    std::mutex dyn_mtx_;
+    std::vector<DynSphereCPU> dyn_spheres_;
 };
 
 
