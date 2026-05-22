@@ -1,0 +1,213 @@
+\documentclass[UTF8, 11pt]{ctexart}
+\usepackage[a4paper, margin=1in]{geometry}
+\usepackage{amsmath, amssymb, bm}
+\usepackage{hyperref}
+
+\title{闭环飞行动力学:\\
+       Pass-1 限幅双积分器 vs. Pass-2 最小 jerk Poly5}
+\author{REACT stage-5.B 实现后补}
+\date{2026-05-22}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\dt}{\,\mathrm{d}t}
+
+\begin{document}
+\maketitle
+
+英文版:\href{run:./05_closedloop_dynamics.tex}{05\_closedloop\_dynamics.tex}
+
+Stage-5.B 闭环驱动(\texttt{scripts/stage5\_closedloop\_eval.py})用
+\texttt{--dynamics} flag 切两种 dynamics。两种都消费同一份 planner 输出
+(在 $t = T \approx 1.7\,$s 处的预测 endstate);区别在**两次 planner 调用
+之间怎么把无人机往前推**。本文档推导两种数学,讨论它们对闭环 SR 测量的影响。
+
+\section{两种 Pass 共同的 setup}
+
+planner $\pi_\theta$ 每个规划步($\Delta = 33\,$ms,30\,Hz)调用一次。它消费
+(depth, obs) 对,对 \emph{argmin-score} 的 anchor 输出:
+\begin{equation}\label{eq:planner-out}
+(\bm{p}_{\text{end}},\, \bm{v}_{\text{end}},\, \bm{a}_{\text{end}}) \;=\; \pi_\theta(I_{\text{depth}}, \bm{o})
+\quad\text{在预测时间 } t = T\text{ 处},
+\end{equation}
+全部已经乘上 $R_{wc}$ 并偏移到当前无人机位置(即世界系)。然后驱动要把无人机
+状态 $(\bm{p}, \bm{v}, \bm{a})$ 推进 $\Delta = 33\,$ms。
+
+\section{Pass-1:限幅双积分器}
+
+状态 $\bm{x} = (\bm{p}, \bm{v}) \in \R^6$。每步更新:
+\begin{align}
+\bm{v}_{\text{desired}}      &= \frac{\bm{p}_{\text{end}} - \bm{p}}{T} \label{eq:vdes}\\
+\bm{v}_{\text{desired}}      &\leftarrow \min\!\left(1,\,\frac{v_{\max}}{\Norm{\bm{v}_{\text{desired}}}}\right) \cdot \bm{v}_{\text{desired}}\\
+\Delta\bm{v}                  &= \bm{v}_{\text{desired}} - \bm{v}\\
+\Delta\bm{v}                  &\leftarrow \min\!\left(1,\,\frac{a_{\max}\Delta}{\Norm{\Delta\bm{v}}}\right) \cdot \Delta\bm{v}\\
+\bm{v}_{\text{new}}           &= \bm{v} + \Delta\bm{v}\\
+\bm{p}_{\text{new}}           &= \bm{p} + \bm{v}_{\text{new}}\Delta \quad\text{(显式 Euler)} \label{eq:p-euler}
+\end{align}
+
+\subsection{经典控制读法}
+
+\eqref{eq:vdes} 是一个**带速率限制的比例位置控制器**,增益 $1/T$。两个 L2
+范数 clip 把速度和加速度的幅值约束在半径 $v_{\max}$ 和 $a_{\max}\Delta$ 的
+球内。\eqref{eq:p-euler} 是最简单的一阶前向 Euler 积分。
+
+\subsection{Pass-1 丢掉了什么}
+
+\begin{enumerate}
+  \item **预测的速度和加速度** $(\bm{v}_{\text{end}}, \bm{a}_{\text{end}})$ 被忽略 —— 只用了位置目标 $\bm{p}_{\text{end}}$。planner 被要求"在 $T$ 秒内到达 $\bm{p}_{\text{end}}$";中间怎么走,是积分器选择的,不是 planner 选择的。
+  \item **加速度是分段常数**,只在两次 clip 切换之间常数。jerk = $\mathrm{d}\bm{a}/\dt$ 在 clip 切换点是 delta 函数。这对真无人机不物理;最近的经典叫法是"bang-bang 加速度曲线"。
+  \item **$\bm{v}$ 之外没有状态连续性。** 下一次 planner 调用看到一个不连续的 $\bm{a}$,但这只影响 Pass-1 的 report,不影响它的 dynamics —— 积分器不携带 $\bm{a}$ 状态。
+\end{enumerate}
+
+这些恰好是让 Pass-1 便宜且作为 SR 上界的简化:积分器去掉所有的 controller
+跟踪误差,所以**唯一在测的就是 planner 预测的 endstate 本身安不安全**。
+
+\section{Pass-2:5 阶多项式(min-jerk)}
+
+状态 $\bm{x} = (\bm{p}, \bm{v}, \bm{a}) \in \R^9$ —— 现在**每轴三个状态**
+来支持加速度的边界条件。对每个轴 $k \in \{x, y, z\}$ 独立,规划一条多项式轨迹:
+\begin{equation}\label{eq:poly5}
+p_k(t) \;=\; \sum_{i=0}^{5} c_i\, t^{i}, \qquad t \in [0, T].
+\end{equation}
+六个系数 $c_0,\dots,c_5$ 由六个边界条件 $\bigl(p(0), v(0), a(0), p(T), v(T), a(T)\bigr)$ 唯一确定:
+\begin{align}
+p(0) &= p_0 \;\Longrightarrow\; c_0 = p_0,\\
+v(0) &= v_0 \;\Longrightarrow\; c_1 = v_0,\\
+a(0) &= a_0 \;\Longrightarrow\; c_2 = a_0 / 2.
+\end{align}
+剩下三个来自 $\bigl(p(T)=p_1,\, v(T)=v_1,\, a(T)=a_1\bigr)$:
+\begin{align}
+\begin{bmatrix} T^3 & T^4 & T^5 \\ 3T^2 & 4T^3 & 5T^4 \\ 6T & 12T^2 & 20T^3 \end{bmatrix}
+\begin{bmatrix} c_3 \\ c_4 \\ c_5 \end{bmatrix}
+&\;=\;
+\begin{bmatrix} p_1 - p_0 - v_0 T - \tfrac{1}{2} a_0 T^2 \\ v_1 - v_0 - a_0 T \\ a_1 - a_0 \end{bmatrix}.
+\end{align}
+求逆得到闭式解(对应 \texttt{YOPO/policy/poly\_solver.py:9-14} 矩阵的后三行):
+\begin{align}
+c_3 &= \tfrac{1}{T^3}\!\bigl[-10(p_0 - p_1) - 6 v_0 T - 4 v_1 T - \tfrac{3}{2} a_0 T^2 + \tfrac{1}{2} a_1 T^2\bigr]\\
+c_4 &= \tfrac{1}{T^4}\!\bigl[\phantom{-}15(p_0 - p_1) + 8 v_0 T + 7 v_1 T + \tfrac{3}{2} a_0 T^2 - a_1 T^2\bigr]\\
+c_5 &= \tfrac{1}{T^5}\!\bigl[-6(p_0 - p_1) - 3 v_0 T - 3 v_1 T - \tfrac{1}{2} a_0 T^2 + \tfrac{1}{2} a_1 T^2\bigr]
+\end{align}
+
+把无人机往前推 $\Delta = 33\,$ms:
+\begin{align}
+p_k(\Delta) &= c_0 + c_1\Delta + c_2 \Delta^2 + c_3 \Delta^3 + c_4 \Delta^4 + c_5 \Delta^5\\
+v_k(\Delta) &= c_1 + 2 c_2\Delta + 3 c_3 \Delta^2 + 4 c_4 \Delta^3 + 5 c_5 \Delta^4\\
+a_k(\Delta) &= 2 c_2 + 6 c_3\Delta + 12 c_4 \Delta^2 + 20 c_5 \Delta^3
+\end{align}
+然后从这个新状态在下一个 planner 步重新规划。
+
+\subsection{为什么\emph{这个}多项式:最小 jerk}
+
+在所有满足六个边界条件的 $C^2([0,T])$ 轨迹中,5 阶多项式 $p_k(t)$ 唯一最小化
+积分平方 jerk:
+\begin{equation}\label{eq:minjerk-objective}
+p_k(\cdot) \;=\; \arg\min_{p \in C^2[0,T]} \int_0^T \!\!\!\Bigl(\dddot{p}(t)\Bigr)^{\!2} \dt \quad\text{s.t.\ b.c.s\ on }p(0),\dot{p}(0),\ddot{p}(0),p(T),\dot{p}(T),\ddot{p}(T).
+\end{equation}
+这是经典的 **Hogan-Flash 最小 jerk 问题**(Hogan 1984,Flash \& Hogan 1985,
+最初用于人臂触达运动)。目标函数 \eqref{eq:minjerk-objective} 的 Euler-Lagrange
+方程是 $\frac{\mathrm{d}^6 p}{\mathrm{d}t^6} = 0$,其通解是 5 阶多项式。然后
+六个边界条件把它唯一确定。
+
+\subsection{微分平坦联系}
+
+对四旋翼,Mellinger \& Kumar(ICRA 2011)证明系统在输出 $\bm{\sigma}(t) = (x(t), y(t), z(t), \psi(t))$
+($\psi$ 是 yaw)下\textbf{微分平坦}。给定 $\bm{\sigma}$ 及其到 4 阶的导数,
+完整状态 —— 姿态 $R$、机体角速度 $\bm{\Omega}$、推力 $T$ —— 都可恢复:
+\begin{equation}
+T = m\bigl(\ddot{\bm{p}} + g \bm{e}_3\bigr), \qquad R \bm{e}_3 \;\propto\; (\ddot{\bm{p}} + g\bm{e}_3), \qquad \bm{\Omega} \;\propto\; \dddot{\bm{p}},\,\ldots
+\end{equation}
+**最小 jerk 位置轨迹因此对应最小机体角速度的姿态曲线**,板载姿态控制器能用
+最小努力跟踪。具体:
+\begin{itemize}
+  \item Pass-1 的 jerk-无界加速度曲线需要无限机体角速度才能完美跟踪 —— 做不到。
+  \item Pass-2 平滑的 jerk 恰好是真 SO(3) 姿态控制器(如 Lee-Leok-McClamroch 2010)被设计来跟的。
+\end{itemize}
+
+\subsection{Min-jerk vs.\ min-snap}
+
+**Min-snap**(Mellinger-Kumar 2011 默认)最小化 4 阶导数代替:
+\begin{equation}
+\int_0^T \!\!\Bigl(\frac{\mathrm{d}^4 p}{\mathrm{d}t^4}\Bigr)^{\!2}\dt.
+\end{equation}
+这产出一条 7 阶多项式,8 个自由系数,允许额外的 jerk 边界条件。Min-snap 更激进
+(更低的机体角加速度),production 级 drone racing 栈用它。
+
+REACT 闭环\emph{评估}用 min-jerk,理由:
+\begin{enumerate}
+  \item planner 在 endstate 只输出 $(\bm{p}, \bm{v}, \bm{a})$,不输出 jerk —— 六个边界条件、六个未知数,只能 Poly5。
+  \item 每 33\,ms 重规划意味着\emph{任何}重规划边界的不连续会被立刻重新光滑。4 阶导数惩罚只在无人机执行整整 $T = 1.7\,$s 单条多项式不重规划时才重要。
+  \item \texttt{YOPO/policy/poly\_solver.py::Poly5Solver} 已经在 repo 里,\texttt{test\_yopo\_ros.py} 部署时就用它。Pass-2 因此\emph{就是真机部署的代码路径}(除了多项式之下的 SO(3) 姿态控制器和电机动力学)。
+\end{enumerate}
+
+\section{对比 + 对 SR 测量的影响}
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+属性 & Pass-1 & Pass-2 \\
+\hline
+积分器状态                & $(\bm{p}, \bm{v}) \in \R^6$ & $(\bm{p}, \bm{v}, \bm{a}) \in \R^9$ \\
+位置更新                 & 显式 Euler & 多项式在 $\Delta$ 处求值 \\
+速度更新                 & Clip 后的 $\Delta\bm{v}$ & 多项式导数 \\
+加速度                   & 分段常数 + clip & 在重规划之间 $C^1$ 光滑 \\
+Jerk                    & Clip 切换处 $\delta$ 尖峰 & 有界;分段多项式 \\
+消费的边界条件             & 仅位置 & 位置 + 速度 + 加速度 \\
+最优性                   & 无 & $\min \int j^2 \dt$ \\
+能在四旋翼上实现?           & 否(无限机体角速度) & 是(匹配微分平坦) \\
+每步算力(3 轴)            & ${\sim}1\,\mu$s & ${\sim}30\,\mu$s \\
+部署代码路径               & \emph{不用} & \emph{跟 \texttt{test\_yopo\_ros.py} 完全一致} \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{为什么 Pass-1 高估 SR}
+
+Pass-1 里无人机以无限 jerk "snap" 到 planner 的位置目标。它不携带加速度状态
+到下一个 planner 步,所以 planner 看到的是一架完美响应、零跟踪误差的无人机。
+具体:
+
+\begin{itemize}
+  \item planner 在(当前状态 $\to$ 预测 endstate)中间的轨迹从不被检验 —— 只要求 endstate 安全。
+  \item 连续 planner 输出之间的"bang-bang"方向切换是免费执行。
+  \item 一架在真硬件上得倾斜 ${\sim}30^\circ$ 才能跟上的急速度变化,在 Pass-1 看来是瞬时跟踪。
+\end{itemize}
+
+文献把 Pass-1$\to$Pass-2 的 gap 量化为障碍密集动态场景下 SR 大约 ${\sim}20$
+个百分点(参 \href{https://arxiv.org/abs/2301.07430}{AvoidBench 2023} Table~3
+对比 kinematic vs.\ flatness-based 评估时的隐式数字)。
+
+\subsection{Pass-2 $\to$ 真飞行剩余的 gap}
+
+Pass-2 仍然把无人机当微分平坦理想 —— 没 SO(3) 姿态控制器、没电机动力学、
+没空气阻力、没传感器噪声。Pass-2 到真飞行的 gap 主要来自:
+
+\begin{enumerate}
+  \item **SO(3) 姿态控制器带宽** ${\sim}50\,$Hz:跟不上重规划边界的 jerk 跳跃。
+  \item **电机时间常数** ${\sim}20\,$ms:推力阶跃响应有 lag。
+  \item **质量参数不确定**($m$、$I$ 各 ${\pm}5\%$):影响 Pass-2 默认精确的微分平坦映射。
+  \item **传感器噪声**(深度像素量化、IMU 漂移):我们 sim 里没有。
+\end{enumerate}
+
+公开 benchmark(Loquercio 等 \emph{Science Robotics} 2021;DiffPhysDrone Nature MI 2025)报道的 Pass-2 类 sim SR 通常比同等障碍分布的真飞行 SR 高 ${\sim}5{-}10$ 个百分点。
+
+\section{Stage-5.B 数字}
+
+\begin{center}
+\begin{tabular}{lcc}
+\hline
+                          & Pass-1 SR             & Pass-2 SR             \\
+\hline
+Baseline YOPO(无 REACT)  & 23\,\% \emph{(2026-05-22 实测)} & 还没测 \\
+C1 stage-3.1              & 训练中                & 训练中                \\
+C2 stage-3.4              & 还没启动              & 还没启动              \\
+论文目标                   & --                    & $\ge 85\,\%$          \\
+真飞行目标                 & --                    & $\ge 85\,\% - 10\,\%$ 余量 \\
+\hline
+\end{tabular}
+\end{center}
+
+论文里**Pass-2 SR 是要 cite 的数字**。Pass-1 SR 作为"planner 上界"补充材料,
+用于诊断:Pass-1 低 = planner 锅;Pass-1 高 + Pass-2 低 = controller/跟踪锅。
+
+\end{document}

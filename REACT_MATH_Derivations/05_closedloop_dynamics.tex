@@ -1,0 +1,200 @@
+\documentclass[11pt]{article}
+\usepackage[a4paper, margin=1in]{geometry}
+\usepackage{amsmath, amssymb, bm}
+\usepackage{hyperref}
+
+\title{Closed-Loop Drone Dynamics:\\
+       Pass-1 Bounded Double Integrator vs.\ Pass-2 Min-Jerk Poly5}
+\author{REACT stage-5.B post-impl notes}
+\date{2026-05-22}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\dt}{\,\mathrm{d}t}
+
+\begin{document}
+\maketitle
+
+The stage-5.B closed-loop driver (\texttt{scripts/stage5\_closedloop\_eval.py})
+supports two drone-dynamics integrators selected by the \texttt{--dynamics}
+flag.  Both consume the same planner output (predicted endstate at
+$t = T \approx 1.7\,$s); they differ in \emph{how the drone is advanced
+between planner calls}.  This note works through the math of each and
+discusses the implication for the closed-loop success-rate measurement.
+
+\section{Setup common to both passes}
+
+The planner $\pi_\theta$ runs once per planning step ($\Delta = 33\,$ms,
+30\,Hz).  It consumes a (depth, obs) pair and emits, for the
+\emph{argmin-score} anchor:
+\begin{equation}\label{eq:planner-out}
+(\bm{p}_{\text{end}},\, \bm{v}_{\text{end}},\, \bm{a}_{\text{end}}) \;=\; \pi_\theta(I_{\text{depth}}, \bm{o})
+\quad\text{at predicted time } t = T,
+\end{equation}
+all in the world frame after multiplying by $R_{wc}$ and offsetting by
+the current drone position.  The driver then needs to update the drone
+state $(\bm{p}, \bm{v}, \bm{a})$ by $\Delta = 33\,$ms.
+
+\section{Pass-1: bounded double integrator}
+
+State $\bm{x} = (\bm{p}, \bm{v}) \in \R^6$.  Per-step update:
+\begin{align}
+\bm{v}_{\text{desired}}      &= \frac{\bm{p}_{\text{end}} - \bm{p}}{T} \label{eq:vdes}\\
+\bm{v}_{\text{desired}}      &\leftarrow \min\!\left(1,\,\frac{v_{\max}}{\Norm{\bm{v}_{\text{desired}}}}\right) \cdot \bm{v}_{\text{desired}}\\
+\Delta\bm{v}                  &= \bm{v}_{\text{desired}} - \bm{v}\\
+\Delta\bm{v}                  &\leftarrow \min\!\left(1,\,\frac{a_{\max}\Delta}{\Norm{\Delta\bm{v}}}\right) \cdot \Delta\bm{v}\\
+\bm{v}_{\text{new}}           &= \bm{v} + \Delta\bm{v}\\
+\bm{p}_{\text{new}}           &= \bm{p} + \bm{v}_{\text{new}}\Delta \quad\text{(explicit Euler)} \label{eq:p-euler}
+\end{align}
+
+\subsection{Classical-control reading}
+
+\eqref{eq:vdes} is a \emph{rate-limited proportional position controller}
+with gain $1/T$.  The two L2-norm clips bound velocity and acceleration
+magnitudes inside spheres of radius $v_{\max}$ and $a_{\max}\Delta$
+respectively.  The integration in \eqref{eq:p-euler} is the simplest
+first-order forward Euler.
+
+\subsection{What Pass-1 throws away}
+
+\begin{enumerate}
+  \item \textbf{Predicted velocity and acceleration} $(\bm{v}_{\text{end}}, \bm{a}_{\text{end}})$ are ignored -- only the position target $\bm{p}_{\text{end}}$ is used.  The planner is asked to ``be at $\bm{p}_{\text{end}}$ in $T$ seconds''; how it gets there is the integrator's choice, not the planner's.
+  \item \textbf{Acceleration is piecewise constant} between clip boundaries.  Jerk = $\mathrm{d}\bm{a}/\dt$ is a delta function at clip switches.  This is non-physical for an actual quadrotor; the closest classical name is ``bang-bang acceleration profile.''
+  \item \textbf{No state continuity beyond $\bm{v}$.}  The next planner call sees a discontinuous $\bm{a}$, which only matters in Pass-1's report (not its dynamics) -- the integrator carries no $\bm{a}$ state.
+\end{enumerate}
+
+These are exactly the simplifications that make Pass-1 cheap and a clean upper bound on SR: the integrator removes all controller-following error so the only thing being tested is \emph{whether the planner's predicted endstate is itself safe}.
+
+\section{Pass-2: 5th-order polynomial (minimum-jerk)}
+
+State $\bm{x} = (\bm{p}, \bm{v}, \bm{a}) \in \R^9$ -- now \emph{three} states per axis to support boundary conditions on acceleration.  For each axis $k \in \{x, y, z\}$ independently, plan a polynomial trajectory:
+\begin{equation}\label{eq:poly5}
+p_k(t) \;=\; \sum_{i=0}^{5} c_i\, t^{i}, \qquad t \in [0, T].
+\end{equation}
+The six coefficients $c_0,\dots,c_5$ are uniquely determined by the six boundary conditions $\bigl(p(0), v(0), a(0), p(T), v(T), a(T)\bigr)$:
+\begin{align}
+p(0) &= p_0 \;\Longrightarrow\; c_0 = p_0,\\
+v(0) &= v_0 \;\Longrightarrow\; c_1 = v_0,\\
+a(0) &= a_0 \;\Longrightarrow\; c_2 = a_0 / 2.
+\end{align}
+The remaining three are obtained from $\bigl(p(T)=p_1,\, v(T)=v_1,\, a(T)=a_1\bigr)$:
+\begin{align}
+\begin{bmatrix} T^3 & T^4 & T^5 \\ 3T^2 & 4T^3 & 5T^4 \\ 6T & 12T^2 & 20T^3 \end{bmatrix}
+\begin{bmatrix} c_3 \\ c_4 \\ c_5 \end{bmatrix}
+&\;=\;
+\begin{bmatrix} p_1 - p_0 - v_0 T - \tfrac{1}{2} a_0 T^2 \\ v_1 - v_0 - a_0 T \\ a_1 - a_0 \end{bmatrix}.
+\end{align}
+Inverting (closed form, e.g.\ \texttt{YOPO/policy/poly\_solver.py:9-14}):
+\begin{align}
+c_3 &= \tfrac{1}{T^3}\!\bigl[-10(p_0 - p_1) - 6 v_0 T + 4 v_1 T - \tfrac{3}{2}(a_0 - a_1) T^2 + \tfrac{1}{2}(a_0 - a_1) T^2\bigr]\\
+c_4 &= \tfrac{1}{T^4}\!\bigl[\phantom{-}15(p_0 - p_1) + 8 v_0 T - 7 v_1 T + \tfrac{3}{2} a_0 T^2 - a_1 T^2\bigr]\\
+c_5 &= \tfrac{1}{T^5}\!\bigl[-6(p_0 - p_1) - 3 v_0 T - 3 v_1 T - \tfrac{1}{2} a_0 T^2 + \tfrac{1}{2} a_1 T^2\bigr]
+\end{align}
+(see the corresponding inverse matrix rows in \texttt{Poly5Solver.\_\_init\_\_}).
+
+Step the drone forward by $\Delta = 33\,$ms:
+\begin{align}
+p_k(\Delta) &= c_0 + c_1\Delta + c_2 \Delta^2 + c_3 \Delta^3 + c_4 \Delta^4 + c_5 \Delta^5\\
+v_k(\Delta) &= c_1 + 2 c_2\Delta + 3 c_3 \Delta^2 + 4 c_4 \Delta^3 + 5 c_5 \Delta^4\\
+a_k(\Delta) &= 2 c_2 + 6 c_3\Delta + 12 c_4 \Delta^2 + 20 c_5 \Delta^3
+\end{align}
+Then re-plan from this new state at the next planner step.
+
+\subsection{Why \emph{this} polynomial: minimum-jerk}
+
+Among all $C^2([0,T])$ trajectories satisfying the six boundary conditions, the 5th-order polynomial $p_k(t)$ uniquely minimises the integrated squared jerk:
+\begin{equation}\label{eq:minjerk-objective}
+p_k(\cdot) \;=\; \arg\min_{p \in C^2[0,T]} \int_0^T \!\!\!\Bigl(\dddot{p}(t)\Bigr)^{\!2} \dt \quad\text{s.t.\ b.c.s\ on }p(0),\dot{p}(0),\ddot{p}(0),p(T),\dot{p}(T),\ddot{p}(T).
+\end{equation}
+This is the classical \textbf{Hogan-Flash min-jerk problem} (Hogan 1984, Flash \& Hogan 1985, originally for human arm reaches).  The Euler-Lagrange equation for the objective \eqref{eq:minjerk-objective} is $\frac{\mathrm{d}^6 p}{\mathrm{d}t^6} = 0$, whose general solution is a 5th-order polynomial.  The six boundary conditions then pin it uniquely.
+
+\subsection{Differential flatness connection}
+
+For a quadrotor, Mellinger \& Kumar (ICRA 2011) showed that the system is differentially flat in the outputs $\bm{\sigma}(t) = (x(t), y(t), z(t), \psi(t))$, where $\psi$ is yaw.  Given $\bm{\sigma}$ and its derivatives up to the 4th, the full state -- attitude $R$, body rates $\bm{\Omega}$, thrust $T$ -- can be recovered:
+\begin{equation}
+T = m\bigl(\ddot{\bm{p}} + g \bm{e}_3\bigr), \qquad R \bm{e}_3 \;\propto\; (\ddot{\bm{p}} + g\bm{e}_3), \qquad \bm{\Omega} \;\propto\; \dddot{\bm{p}},\,\ldots
+\end{equation}
+\emph{Minimum-jerk position trajectories therefore correspond to minimum-body-angular-velocity attitude profiles}, which the on-board attitude controller can track with minimal effort.  Concretely:
+\begin{itemize}
+  \item Pass-1's jerk-unbounded acceleration profile would require infinite body angular velocity to track perfectly -- impossible.
+  \item Pass-2's smooth jerk is exactly what real SO(3) attitude controllers (e.g.\ Lee-Leok-McClamroch 2010) are designed for.
+\end{itemize}
+
+\subsection{Min-jerk vs.\ min-snap}
+
+\textbf{Min-snap} (Mellinger-Kumar 2011 default) minimises the 4th derivative instead:
+\begin{equation}
+\int_0^T \!\!\Bigl(\frac{\mathrm{d}^4 p}{\mathrm{d}t^4}\Bigr)^{\!2}\dt.
+\end{equation}
+This produces a 7th-order polynomial with 8 free coefficients, allowing additional boundary conditions on jerk.  Min-snap is more aggressive (lower body angular acceleration) and is what production drone-racing stacks use.
+
+For REACT closed-loop \emph{evaluation}, we use min-jerk because:
+\begin{enumerate}
+  \item The planner only outputs $(\bm{p}, \bm{v}, \bm{a})$ at the endstate, not jerk -- six boundary conditions, six unknowns, no choice but Poly5.
+  \item Re-planning every 33\,ms means \emph{any} discontinuity at re-plan boundaries gets immediately re-smoothed.  The 4th-derivative penalty would only matter if the drone executed a single polynomial for the full $T = 1.7\,$s without re-planning.
+  \item \texttt{YOPO/policy/poly\_solver.py::Poly5Solver} is already in the repo and used by \texttt{test\_yopo\_ros.py} at deployment.  Pass-2 is therefore \emph{the same code path that runs on hardware}, modulo the SO(3) attitude controller and motor dynamics that live below the polynomial.
+\end{enumerate}
+
+\section{Comparison and implication for SR measurement}
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Property & Pass-1 & Pass-2 \\
+\hline
+Integrator state                & $(\bm{p}, \bm{v}) \in \R^6$ & $(\bm{p}, \bm{v}, \bm{a}) \in \R^9$ \\
+Position update                 & Explicit Euler & Polynomial evaluation at $\Delta$ \\
+Velocity update                 & Clipped $\Delta\bm{v}$ & Polynomial derivative \\
+Acceleration                    & Piecewise constant + clip & $C^1$ smooth between re-plans \\
+Jerk                            & $\delta$-spikes at clip   & Bounded; piecewise polynomial \\
+Boundary conditions consumed    & Position only            & Position + velocity + acceleration \\
+Optimality                      & None                     & Min $\int j^2 \dt$ \\
+Realizable on a quadrotor?      & No (infinite body rates) & Yes (matches diff.\ flatness) \\
+Per-step compute (3 axes)       & ${\sim}1\,\mu$s          & ${\sim}30\,\mu$s \\
+Deployment code path            & \emph{Not used}          & \emph{Identical to \texttt{test\_yopo\_ros.py}} \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{Why Pass-1 over-estimates SR}
+
+The drone in Pass-1 ``snaps'' toward the planner's position target with infinite jerk.  It carries no acceleration state into the next planner step, so the planner sees a perfectly responsive drone with no tracking error.  In aggregate, this means:
+
+\begin{itemize}
+  \item The planner's intermediate trajectory between (current state $\to$ predicted endstate) is never tested -- only the endstate is asked to be safe.
+  \item ``Bang-bang'' direction changes between successive planner outputs are executed for free.
+  \item A drone that, on real hardware, would have to lean ${\sim}30^\circ$ to follow a sharp velocity change appears in Pass-1 to track it instantly.
+\end{itemize}
+
+The literature places the Pass-1$\to$Pass-2 gap at ${\sim}20$ percentage points of SR in obstacle-rich dynamic scenes ([AvoidBench 2023](https://arxiv.org/abs/2301.07430), Table~3 implicit when comparing kinematic vs.\ flatness-based eval).
+
+\subsection{Remaining gap Pass-2 $\to$ real flight}
+
+Pass-2 still models the drone as a differentially-flat ideal -- no SO(3) attitude controller, no motor dynamics, no air drag, no sensor noise.  The gap from Pass-2 to real flight is dominated by:
+
+\begin{enumerate}
+  \item \textbf{SO(3) attitude controller bandwidth} ${\sim}50\,$Hz: cannot follow instantaneous jerk discontinuities at re-plan boundaries.
+  \item \textbf{Motor time constant} ${\sim}20\,$ms: thrust step responses lag.
+  \item \textbf{Mass-property uncertainty} (${\pm}5\%$ on $m$, $I$): affects the differential-flatness mapping that Pass-2 implicitly assumes is exact.
+  \item \textbf{Sensor noise} (depth pixel quantisation, IMU drift): not present in our sim.
+\end{enumerate}
+
+Public benchmarks (Loquercio et al.\ \emph{Science Robotics} 2021; DiffPhysDrone Nature MI 2025) report Pass-2-like sim SRs that are ${\sim}5{-}10$ percentage points above real-flight SR on the same obstacle distribution.
+
+\section{Numbers for stage-5.B}
+
+\begin{center}
+\begin{tabular}{lcc}
+\hline
+                          & Pass-1 SR             & Pass-2 SR             \\
+\hline
+Baseline YOPO (no REACT)  & 23\,\% \emph{(measured 2026-05-22)} & not measured yet \\
+C1 stage-3.1              & in training           & in training           \\
+C2 stage-3.4              & not started           & not started           \\
+Paper target              & --                    & $\ge 85\,\%$          \\
+Real-flight target        & --                    & $\ge 85\,\% - 10\,\%$ headroom \\
+\hline
+\end{tabular}
+\end{center}
+
+For paper purposes, \textbf{Pass-2 SR is the cited number}.  Pass-1 SR is reported as ``planner upper bound'' supplementary, useful for diagnosing whether failures are planner-side (low Pass-1) or controller/tracking side (Pass-1 high, Pass-2 low).

@@ -12,6 +12,7 @@
 | [02_multi_waypoint_extension.tex](02_multi_waypoint_extension.tex) / [02_multi_waypoint_extension_cn.tex](02_multi_waypoint_extension_cn.tex) | Option B(多 waypoint GRU decoder)如何把损失从 per-anchor 推广到 per-waypoint;kinodynamic 损失为何在多 waypoint 下"真正激活" | stage-3.6 后 |
 | [03_esdf_time_replacement.tex](03_esdf_time_replacement.tex) / [03_esdf_time_replacement_cn.tex](03_esdf_time_replacement_cn.tex) | 把 stage-3.1 `random map_idx` 捷径换成真实动态场景 ESDF 的推导;时空 ESDF 的梯度 | stage-3.6 后 |
 | [04_stage5_deployment_math.tex](04_stage5_deployment_math.tex) / [04_stage5_deployment_math_cn.tex](04_stage5_deployment_math_cn.tex) | <10 ms 推理延迟预算分解;K=10 stateless vs stateful GRU 的延迟数学;≥85% 成功率与 dyn_dyn 的(假设)关系 | stage-3.6 后 |
+| [05_closedloop_dynamics.tex](05_closedloop_dynamics.tex) / [05_closedloop_dynamics_cn.tex](05_closedloop_dynamics_cn.tex) | 闭环驱动两种 dynamics 的推导:Pass-1 限幅双积分器(SR 上界)vs Pass-2 5 阶多项式(min-jerk + 微分平坦,真机部署同款) | stage-5.B 后 |
 
 ## 引用规范
 
