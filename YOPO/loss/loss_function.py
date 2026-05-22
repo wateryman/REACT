@@ -113,6 +113,37 @@ class YOPOLoss(nn.Module):
         return self.smoothness_weight * smoothness_cost, self.safety_weight * safety_cost, self.goal_weight * goal_cost, self.accele_weight * acceleration_cost
 
     @staticmethod
+    def z_floor_loss(end_pos_w, z_floor: float = 0.3, lam_floor: float = 1.0):
+        """🟦 stage-5.B plan B: penalise endstate world-frame z below a floor.
+
+        The motivating observation: the SafetyLoss queries an ESDF computed
+        from a static point cloud that has no ground plane.  For any
+        endstate prediction with z < 0 (below the lowest cloud point), the
+        ESDF returns a large free-space distance -> low safety cost ->
+        the score head learns to prefer "look down" anchors.  See
+        REACT_MATH_Derivations/01_collision_loss_saturation.tex §4 and
+        the stage-5.B closed-loop debug log for the empirical signature
+        (C1 trained model predicts end_z ~ -2 m and dives below ground).
+
+        Loss: quadratic soft hinge below z_floor, zero above.  The
+        gradient pushes the predicted endstate UP when it dips below
+        z_floor.
+
+        Args
+        ----
+        end_pos_w : (B*V*H, 3) world-frame predicted endstate position
+        z_floor   : minimum allowed world-frame z (m).  Default 0.3 m
+                    matches the bake's ball-z floor (bbox_z_lo).
+        lam_floor : multiplier applied to the squared hinge.
+
+        Returns
+        -------
+        Already-weighted scalar (so the caller does
+        `loss_total += yopo_loss.z_floor_loss(...)`).
+        """
+        return lam_floor * th.relu(z_floor - end_pos_w[..., 2]).pow(2).mean()
+
+    @staticmethod
     def revae_loss(recon, target, mu, logvar, lam_recon: float = 1.0, lam_kl: float = 1e-3):
         """🟩 PEMTRS reVAE loss = lam_recon * MSE(recon, target) + lam_kl * KL.
 

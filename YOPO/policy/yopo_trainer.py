@@ -293,9 +293,24 @@ class YopoTrainer:
         end_state_w = torch.stack([end_pos_w, end_vel_w, end_acc_w], dim=1)
 
         smooth_cost, safety_cost, goal_cost, acc_cost = self.yopo_loss(start_state_w_exp, end_state_w, goal_w, map_id)
-        trajectory_loss = (smooth_cost + safety_cost + goal_cost + acc_cost).mean()
 
-        score_label = (smooth_cost + safety_cost + goal_cost + acc_cost).clone().detach()
+        # 🟦 stage-5.B plan B: add a per-anchor z-floor cost so the model
+        # cannot dive below ground.  Folded into trajectory_loss AND into
+        # score_label so the score head also learns "below-floor anchors
+        # are bad".  Default z_floor / lam from cfg["z_floor"]; absent ->
+        # disabled (lam=0).
+        zf_cfg = cfg._data.get("z_floor", {"enable": False, "z_floor_m": 0.3, "lam_floor": 5.0})
+        if zf_cfg.get("enable", False):
+            zfloor = float(zf_cfg["z_floor_m"])
+            lam_floor = float(zf_cfg["lam_floor"])
+            z_below = torch.relu(zfloor - end_pos_w[..., 2])     # (B*V*H,)
+            z_floor_cost = lam_floor * z_below.pow(2)            # (B*V*H,) per-anchor
+        else:
+            z_floor_cost = torch.zeros_like(smooth_cost)
+
+        trajectory_loss = (smooth_cost + safety_cost + goal_cost + acc_cost + z_floor_cost).mean()
+
+        score_label = (smooth_cost + safety_cost + goal_cost + acc_cost + z_floor_cost).clone().detach()
         score_loss = F.smooth_l1_loss(score_flat, score_label)
 
         # 🟩 reVAE loss (skipped when use_revae=False)

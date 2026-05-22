@@ -225,9 +225,22 @@ class Planner:
         endstate, score, _recon, _mu, _logvar = self.net.inference(depth_t, obs_t)
         # endstate: (1, 9, V, H), score: (1, V, H)
         e = endstate[0].cpu().numpy()       # (9, V, H)
-        s = score[0].cpu().numpy().reshape(-1)
-        best = int(np.argmin(s))
         Vh, Wh = endstate.shape[-2], endstate.shape[-1]
+        s = score[0].cpu().numpy().reshape(-1)
+        # 🟦 stage-5.B hack: the trained model exploits a gap in safety_loss
+        # (ESDF is undefined below z=0 because the static point cloud has no
+        # ground plane), and consistently scores "look down" anchors lowest.
+        # Filter argmin to anchors whose body-frame end_z > -1.0 m so the
+        # drone doesn't dive into the ground.  This is a deploy-side hack
+        # to validate the architecture; the long-term fix is a z-floor
+        # loss term in the trainer (stage-5.B plan B).
+        end_z_body = e[2].reshape(-1)       # (V*H,)
+        z_mask = end_z_body > -1.0
+        if z_mask.any():
+            s_masked = np.where(z_mask, s, np.inf)
+            best = int(np.argmin(s_masked))
+        else:
+            best = int(np.argmin(s))         # fall back if all anchors below threshold
         v_idx, h_idx = best // Wh, best % Wh
         # Body-frame endstate fields: [px, py, pz, vx, vy, vz, ax, ay, az]
         end_pos_b = e[0:3, v_idx, h_idx]
@@ -287,12 +300,17 @@ def run_scenario(scenario, bridge, planner, args):
                     "time_to_goal_s": float("nan"),
                     "min_clearance_m": min_clearance, "n_steps": step,
                     "mean_speed": 0.0}
-        # 3b. static-collision check via depth center patch
+        # 3b. static-collision check.  Two indicators:
+        # (i) center depth patch min < threshold (front-of-drone obstacle)
+        # (ii) 🟦 drone world z below ground floor (z < 0.1 m) -- catches
+        #      the "model dives below ground" failure mode when the
+        #      anchor filter doesn't fully save us.
         h0, w0 = depth.shape[0], depth.shape[1]
         cy0, cx0 = h0 // 2, w0 // 2
         center_patch = depth[cy0 - 2:cy0 + 3, cx0 - 2:cx0 + 3]
         center_min = float(np.nanmin(center_patch))
-        if center_min < static_collision_depth_m:
+        ground_floor = 0.1
+        if center_min < static_collision_depth_m or pos[2] < ground_floor:
             return {"terminate_reason": "static_collision", "step": step,
                     "time_to_goal_s": float("nan"),
                     "min_clearance_m": min_clearance, "n_steps": step,
@@ -344,11 +362,23 @@ def run_scenario(scenario, bridge, planner, args):
             acc = np.array([poly_x.get_acceleration(dt),
                              poly_y.get_acceleration(dt),
                              poly_z.get_acceleration(dt)], dtype=np.float32)
-        # 7. update heading toward velocity (smoothed)
+        # 7. update heading to face GOAL (not velocity).  This mirrors
+        # YOPO/policy/poly_solver.py::calculate_yaw used by test_yopo_ros.py
+        # at deployment: drone yaws toward the goal vector so the body-frame
+        # obs.goal stays roughly aligned with body +X.  Without this,
+        # planner outputs that lack a lateral component (e.g., the stage-3.1
+        # well-trained C1) cause the drone to drift on a constant-yaw line
+        # and miss laterally-offset goals.  Yaw-rate is rate-limited.
         speed = float(np.linalg.norm(vel))
         speeds.append(speed)
-        if speed > 0.5:
-            yaw_rad = math.atan2(vel[1], vel[0])
+        goal_dir_xy = goal[0:2] - pos[0:2]
+        goal_dist_xy = float(np.linalg.norm(goal_dir_xy))
+        if goal_dist_xy > 0.3:
+            yaw_target = math.atan2(goal_dir_xy[1], goal_dir_xy[0])
+            yaw_err = math.atan2(math.sin(yaw_target - yaw_rad),
+                                   math.cos(yaw_target - yaw_rad))
+            max_dyaw = 2.0 * dt   # 2 rad/s max yaw rate
+            yaw_rad = yaw_rad + max(-max_dyaw, min(max_dyaw, yaw_err))
             quat = yaw_to_quat(yaw_rad)
             rot_wc = R.from_quat(quat).as_matrix().astype(np.float32)
         # 8. ball collision check (after integration so we don't double-count)

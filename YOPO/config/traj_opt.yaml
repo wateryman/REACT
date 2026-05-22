@@ -80,6 +80,15 @@ loss_weights:
   lam_dyn: 3.0           # 🟧 stage-3.1: motion_reshaped_collision_loss weight (highest per guide §3.6)
   lam_kino: 0.5          # 🟧 stage-3.1: kinodynamic_loss weight
 
+# 🟦 stage-5.B plan B: per-anchor z-floor penalty so the model cannot exploit the
+# safety_loss / ESDF gap below z=0 (the static cloud has no ground plane and the
+# ESDF defaults to free-space below the lowest point).  Without this, the score
+# head learns to prefer "look down" anchors that fly the drone into the ground.
+z_floor:
+  enable: false          # default off; per-stage training scripts flip this true
+  z_floor_m: 0.3         # minimum allowed world-frame z (m); matches v3 ball bbox_z_lo
+  lam_floor: 5.0         # squared-hinge weight; pushes endstate UP when below floor
+
 # 🟧 stage-3.1+3.2 dynamic-attention config.
 # max_dyn_obs (stage-3.1): obstacle slots packed per batch by DynamicYOPOWrapper.
 # enable / n_heads (stage-3.2): turn on the DCA side channel inside YopoNetwork.
