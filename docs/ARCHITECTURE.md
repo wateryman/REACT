@@ -355,12 +355,75 @@ Jetson.
 
 - Path-a (temporal) goes into the ablation table as a third row showing
   "architectural upgrade does not separate from baseline at this dataset
-  scale".  Combined with paths b and c this paints a clear "next
-  experiment" arrow: scale dynamic data to 10 k+ sequences.
+  scale".
 - Headline contribution stays stage-3.1 (dyn/kino loss).  Stage-3.2 and
   Stage-3.4 are the two ablation rows.
 - Reproduction:
   - `python scripts/run_stage4_ablation.py --steps 5000 --only F_v2_temporal_off,G_v2_temporal_on --out results/ablation_stage_3_4.csv`
+
+## Stage-3.6 dataset scaling test (v3, 8 000 seq)
+
+After the stage-3.4 verdict pointed at "dataset starvation" as the most
+likely cause of the ~1 % ceiling, v3 quadruples v2: 40 envs × 200 seq
+(3.9 GB, baked in 5 m 02 s, 0 FAIL across 45 verified seqs).
+
+### A/B re-run of F vs G on v3 (`results/ablation_stage_3_4_v3.csv`)
+
+| Metric | F temporal off | G temporal on | Δ |
+|---|---:|---:|---:|
+| total tail | 4.264 | 4.212 | -0.052 (-1.2 %) |
+| stat_traj tail | 3.544 | 3.562 | +0.018 (+0.5 %) |
+| dyn_traj tail | 3.755 | 3.761 | +0.006 (+0.2 %) |
+| **dyn_dyn tail** | **0.2397** | **0.2426** | **+0.0029 (+1.2 %)** |
+| dyn_kino tail | 0.0001 | 0.0001 | 0 |
+| reVAE tail | 0.0354 | 0.0418 | +18 % |
+| wall_s | 145.5 | 217.8 | +50 % |
+
+### Verdict: dataset scale was *not* the binding constraint
+
+Comparing v2 → v3 (2 000 → 8 000 seq, 4 ×):
+
+|  | v2 dyn_dyn | v3 dyn_dyn |
+|---|---:|---:|
+| F (temporal off) | 0.2366 | 0.2397 |
+| G (temporal on)  | 0.2343 | 0.2426 |
+| **G − F**        | **−0.0023 (−1.0 %)** | **+0.0029 (+1.2 %)** |
+
+The G − F gap is essentially zero, with the sign flipping between
+sample runs — pure noise.  **The ~1 % ceiling persists at 4 × data**,
+which falsifies the stage-3.4 hypothesis that path-a was just data-
+starved.
+
+The new most-likely explanation is that the dynamic supervision signal
+(`motion_reshaped_collision_loss` evaluated only at the predicted
+endstate, per-anchor) has already saturated what a single-frame anchor
+prediction can do.  Pushing dyn_dyn lower needs either:
+
+1. A **richer supervision signal** (multi-waypoint kinodynamic, ESDF
+   over the true dynamic scene rather than the random static `map_idx`
+   shortcut, …) — these are *loss* changes, not data or architecture
+   changes.
+2. **Camera-aware ball spawn** so balls are in FOV more than 22-27 % of
+   frames — a data *quality* lever, not a quantity one.  This would
+   directly raise the gradient-signal-to-noise on dynamic batches.
+3. **Option B** (multi-waypoint GRU decoder) so kinodynamic_loss
+   actually activates — a stage-3.7+ scope decision.
+
+### Implication for the paper
+
+The story changes from "dataset starvation kept path-a from working" to
+"three architectural upgrades + 4 × data all hit the same ~1 % ceiling
+above stage-3.1's loss-only baseline".  This is a *stronger* claim:
+the dyn-loss formulation, not the model or data, sets the ceiling.
+Stage-3.6's null result is itself a paper bullet point.
+
+### Reproduction
+
+```
+python scripts/run_stage4_ablation.py --steps 5000 \
+    --only F_v2_temporal_off,G_v2_temporal_on \
+    --out results/ablation_stage_3_4_v3.csv
+```
 
 ## Build/run commands at a glance
 

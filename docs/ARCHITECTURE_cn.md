@@ -344,12 +344,70 @@ profile 大概率打不到 <10 ms。
 ### 论文含义
 
 - Path-a(temporal)进 ablation 表作为第三行,展示"架构升级在当前数据规模
-  下也不能拉开 baseline"。和 path-b、path-c 组合,**清晰地指向"下一步
-  实验":扩动态数据到 10k+ 个 seq**。
+  下也不能拉开 baseline"。
 - Headline 贡献仍然是 stage-3.1(dyn/kino loss)。Stage-3.2 和 stage-3.4
   是两行 ablation。
 - 复现:
   - `python scripts/run_stage4_ablation.py --steps 5000 --only F_v2_temporal_off,G_v2_temporal_on --out results/ablation_stage_3_4.csv`
+
+## Stage-3.6 数据规模测试(v3,8000 seq)
+
+Stage-3.4 收尾时把"dataset starvation"列为 ~1% 上限最可能的原因,v3 直接把
+v2 翻了 4 倍:40 envs × 200 seq(3.9 GB,5 分 02 秒 bake 完,45 个采样 seq
+全部 0 FAIL)。
+
+### v3 上重测 F vs G(`results/ablation_stage_3_4_v3.csv`)
+
+| 指标 | F temporal off | G temporal on | Δ |
+|---|---:|---:|---:|
+| total tail | 4.264 | 4.212 | -0.052(-1.2%) |
+| stat_traj tail | 3.544 | 3.562 | +0.018(+0.5%) |
+| dyn_traj tail | 3.755 | 3.761 | +0.006(+0.2%) |
+| **dyn_dyn tail** | **0.2397** | **0.2426** | **+0.0029(+1.2%)** |
+| dyn_kino tail | 0.0001 | 0.0001 | 0 |
+| reVAE tail | 0.0354 | 0.0418 | +18% |
+| wall_s | 145.5 | 217.8 | +50% |
+
+### 判决:**数据规模不是上限**
+
+v2 → v3(2000 → 8000 seq,4×)对比:
+
+| | v2 dyn_dyn | v3 dyn_dyn |
+|---|---:|---:|
+| F(temporal off) | 0.2366 | 0.2397 |
+| G(temporal on)  | 0.2343 | 0.2426 |
+| **G − F** | **−0.0023(−1.0%)** | **+0.0029(+1.2%)** |
+
+G − F 的差距基本是零,而且**符号在两次跑之间翻转** —— 纯噪声。
+**~1% 的天花板在 4× 数据下仍然存在**,这个事实**证伪了 stage-3.4 关于
+path-a 缺数据的假设**。
+
+新的最可能解释:动态监督信号(`motion_reshaped_collision_loss` 只在预测
+endstate 上算,per-anchor)在单帧 anchor 预测能做到的范围内已经饱和。
+想把 dyn_dyn 再往下压需要:
+
+1. **更丰富的监督信号**(多 waypoint kinodynamic、用真实动态场景的 ESDF
+   而不是当前随机静态 `map_idx` 的捷径,等等)—— 这些是**损失**改动,
+   不是数据或架构改动。
+2. **Camera-aware 球生成**,让球在 FOV 内的帧从 22-27% 拉到更高 —— 数据
+   **质量**杠杆,不是数量杠杆。会直接提高动态 batch 的梯度信噪比。
+3. **Option B**(多 waypoint GRU decoder),让 kinodynamic_loss 真正激活
+   —— stage-3.7+ 的 scope 决定。
+
+### 论文含义
+
+故事从"数据饥饿让 path-a 不工作"变成"三个架构升级 + 4× 数据全部
+撞在 stage-3.1 loss-only baseline 之上 ~1% 的天花板"。这是**更强**的
+结论:**是 dyn-loss formulation 本身设了天花板,不是模型也不是数据**。
+Stage-3.6 的负结论本身就是论文一个 bullet point。
+
+### 复现
+
+```
+python scripts/run_stage4_ablation.py --steps 5000 \
+    --only F_v2_temporal_off,G_v2_temporal_on \
+    --out results/ablation_stage_3_4_v3.csv
+```
 
 ## Build/run 命令速查
 
