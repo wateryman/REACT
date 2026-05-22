@@ -1,0 +1,145 @@
+\documentclass[UTF8, 11pt]{ctexart}
+\usepackage[a4paper, margin=1in]{geometry}
+\usepackage{amsmath, amssymb, bm}
+\usepackage{hyperref}
+
+\title{真实 ESDF-时间 替换静态 \texttt{map\_idx} 捷径}
+\author{REACT stage-3.7+ 候选修复}
+\date{2026-05-22}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\esdf}{\mathcal{D}}
+\newcommand{\softplus}{\operatorname{softplus}}
+
+\begin{document}
+\maketitle
+
+英文版:\href{run:./03_esdf_time_replacement.tex}{03\_esdf\_time\_replacement.tex}
+
+\section{当前捷径及其噪声地板}
+
+\texttt{DynamicYOPOWrapper.\_\_getitem\_\_}(\texttt{policy/yopo\_dataset.py:385})
+分配一个**随机**静态 \texttt{map\_idx}:
+\begin{verbatim}
+map_idx = int(np.random.randint(0, self.env_num_static))
+\end{verbatim}
+
+trainer 然后对**这个随机选**的静态 map 的 ESDF 算 \texttt{YOPOLoss.safety\_loss}。
+当前动态 bake 的真实静态点云(不同的 \texttt{env\_X} 文件夹,不同的森林布局)
+**被默默忽略**。
+
+\subsection{为什么这是个问题}
+
+样本预测 endstate 是 $\bm{p}_i^{\text{pred}}$,查询的(随机)ESDF 是
+$\esdf_{m^*}$,其中 $m^* \sim \mathrm{Uniform}(0, E_{\text{static}})$,监督就是
+\begin{equation}\label{eq:safety-current}
+\mathcal{L}_{\text{safety}}^{\text{cur}}(\bm{p}_i^{\text{pred}})
+\;=\;
+\softplus\bigl(d_{\text{safe}}^{\text{stat}} - \esdf_{m^*}(\bm{p}_i^{\text{pred}})\bigr).
+\end{equation}
+但这个样本**真正**的静态障碍住在动态-bake 自带的 pointcloud 的
+$\{\bm{q}_j\}_{j}$(不同森林)。我们在惩罚网络"撞"这个场景里**不存在**的障碍,
+又**忽略**了真实存在的。
+
+\subsection{噪声分解}
+
+写出期望的"真实"监督
+$\mathcal{L}_{\text{safety}}^{\text{true}} = \softplus(d - \esdf_{\text{true}}(\bm{p}_i^{\text{pred}}))$。
+在查询点 $\bm{p}$ 的当前-vs-真实梯度偏差期望是
+\begin{equation}\label{eq:mismatch}
+\bm{\eta}(\bm{p})
+\;=\;
+\mathbb{E}_{m^*}\!\Bigl[
+   \nabla_{\bm{p}} \mathcal{L}_{\text{safety}}^{\text{cur}}(\bm{p}) -
+   \nabla_{\bm{p}} \mathcal{L}_{\text{safety}}^{\text{true}}(\bm{p})
+\Bigr].
+\end{equation}
+如果静态森林分布足够均匀(i.i.d.\ 树位置、同样密度),当 $E_{\text{static}} \to \infty$
+时 $\Norm{\mathbb{E}_{m^*}[\nabla \esdf_{m^*}]} \to 0$,所以 $\bm{\eta}$ 有
+**零期望偏置**,但**非零方差**。这个方差出现为每一个动态 batch 步骤上的
+梯度噪声。
+
+我们 v3 森林有 $\rho_{\text{tree}}\!\approx\!0.05$ 棵/m$^2$ 和
+$r_{\text{tree}}\!\approx\!0.3\,$m,单样本的 $\Norm{\nabla \esdf}$ 标准差量级
+在远离树边界处约 $\Norm{\nabla \esdf}_{\text{rms}} \approx 1$,在边界附近降为
+$\esdf$ 符号翻转指示。这个噪声对动态 batch 上的 \texttt{stat\_traj\_tail}
+贡献有界但不为零。
+
+\section{直接修复:bake 动态场景自己的 ESDF}
+
+每个 \texttt{dataset\_dynamic/v$X$/env\_$E$/pointcloud.ply} 已经在磁盘上。
+从它算 ESDF voxel grid 是一个标准的一次性预计算(用 \texttt{Simulator/}
+的 \texttt{maps.hpp} 里已有的 KdTree 机制)。$60{\times}60{\times}15\,$m
+在 $0.1\,$m 分辨率下是每个 env $\sim$$5.4\,$M voxel;40 envs $\to$
+$\sim$$216\,$M voxel $\to$ float32 下 $\sim$$1\,$GB。可接受。
+
+\subsection{对移动球的时间感知 ESDF}
+
+为了完整的"ESDF-time"监督(对应
+\texttt{02\_multi\_waypoint\_extension\_cn.tex} 的暗示),定义
+\begin{equation}\label{eq:esdf-time}
+\esdf_{\text{full}}(\bm{p}, t)
+\;=\;
+\min\Bigl\{
+   \esdf_{\text{static}}(\bm{p}),
+   \;
+   \min_{m=1,\dots,M}
+   \bigl[\Norm{\bm{p} - \bm{p}_m^{\text{obs}}(t)} - r_m\bigr]
+\Bigr\},
+\end{equation}
+其中 $\bm{p}_m^{\text{obs}}(t) = \bm{p}_m^{\text{obs}}(0) + t\bm{v}_m^{\text{obs}}$
+(线性运动,跟 bake 一致)。$\esdf_{\text{static}}$ 是预计算的静态点云距离场。
+完整的 safety 监督变成
+\begin{equation}\label{eq:safety-true}
+\mathcal{L}_{\text{safety}}^{\text{full}}(\bm{p}_i, t_i)
+\;=\;
+\softplus\bigl(d_{\text{safe}}^{\text{stat}} - \esdf_{\text{full}}(\bm{p}_i, t_i)\bigr).
+\end{equation}
+
+梯度在内 $\min$ 唯一的地方都良定义 —— 实践中我们用 smooth-min 近似
+$\widetilde{\min}_\beta(x_1, \dots, x_k) = -\beta^{-1}\log\sum_j e^{-\beta x_j}$,
+$\beta \sim 10$,在"静态面 vs 动态面"边界附近稳定下来。
+
+\subsection{时间参数的梯度}
+
+轨迹的 $t^{(n)}$ 是网络输出的可微函数(\texttt{gru\_decoder.py} 里的 time-head
+就预测它们)。对 \eqref{eq:esdf-time} 关于 $t$ 求导:
+\begin{equation}
+\frac{\partial \esdf_{\text{full}}}{\partial t}\Big|_{m^*}
+\;=\;
+\hat{\bm{u}}_{i,m^*} \cdot \bm{v}_{m^*}^{\text{obs}}
+\quad
+\text{(只在动态最小处;静态分支跟 $t$ 无关)}.
+\end{equation}
+这给网络一个直接信号:"挪动 waypoint 的时间能让你离移动障碍更近或更远",
+这是当前 \texttt{safety\_loss} 和 \texttt{motion\_reshaped} 单独都给不了的。
+
+\section{实现代价}
+
+\begin{itemize}
+  \item **Bake 时**:在 \texttt{Simulator/src/src/dataset\_generator.cpp} 里
+        加一个 $\esdf_{\text{static}}$ 预计算的 post-bake 步骤;在每个 env 下
+        跟 \texttt{pointcloud.ply} 一起 ship 一个 \texttt{esdf.bin}
+        (二进制 float grid)。一次性代价,v3 已经有 pointcloud。
+  \item **训练时**:新文件 \texttt{policy/utils/esdf\_query.py} 在 float grid
+        上做三线性插值。CUDA kernel 可选;v3 规模可以先用 CPU(env 数适中)。
+  \item **损失替换**:把 \texttt{YOPOLoss.safety\_loss} 的 \texttt{ESDFQuery}
+        (当前读**静态数据集**用 \texttt{map\_idx} 索引的 ESDF)换成
+        动态场景正确的那个。**严格回归**:静态数据集训练时
+        (\texttt{dynamic\_ratio=0}),静态 ESDF 路径跟今天字节一致。
+\end{itemize}
+
+工作量估计:**3--4 天**;这是三个监督升级里**最便宜**的(对比多 waypoint head
+和 camera-aware bake),但**期望收益最小** —— 它修的是梯度**噪声**源,不是
+结构性饱和。建议在 Option B 之后做,清掉残留噪声。
+
+\section{期望收益(背面估算)}
+
+当前设置下,静态-safety 不匹配贡献了动态 batch 梯度范数的 $\sim$5--10\%。
+消除这个噪声应该把动态 batch 上的 \texttt{stat\_traj\_tail} 类似比例降低
+($\sim$$0.07$ 绝对,从 $\sim$$3.76$ 降到 $\sim$$3.69$)。**不太可能**让
+\texttt{dyn\_dyn} 移动超过 1--2\%,因为
+\texttt{01\_collision\_loss\_saturation\_cn.tex} 的饱和 argument 跟这个修复无关。
+
+\end{document}

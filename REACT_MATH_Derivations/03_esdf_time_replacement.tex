@@ -1,0 +1,161 @@
+\documentclass[11pt]{article}
+\usepackage[a4paper, margin=1in]{geometry}
+\usepackage{amsmath, amssymb, bm}
+\usepackage{hyperref}
+
+\title{Real ESDF-Time Replacement for the Static \texttt{map\_idx} Shortcut}
+\author{REACT stage-3.7+ candidate fix}
+\date{2026-05-22}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\esdf}{\mathcal{D}}
+
+\begin{document}
+\maketitle
+
+\section{The current shortcut and its noise floor}
+
+\texttt{DynamicYOPOWrapper.\_\_getitem\_\_} (\texttt{policy/yopo\_dataset.py:385})
+assigns a random static \texttt{map\_idx}:
+\begin{verbatim}
+map_idx = int(np.random.randint(0, self.env_num_static))
+\end{verbatim}
+
+The trainer then evaluates \texttt{YOPOLoss.safety\_loss} against the ESDF of
+\emph{that randomly selected} static map. The actual dynamic-bake's static
+point cloud --- different \texttt{env\_X} folder, different forest layout ---
+is silently ignored.
+
+\subsection{Why this matters}
+
+For a sample with predicted endstate $\bm{p}_i^{\text{pred}}$ and the (random)
+queried ESDF $\esdf_{m^*}$ where $m^* \sim \mathrm{Uniform}(0, E_{\text{static}})$,
+the supervision is
+\begin{equation}\label{eq:safety-current}
+\mathcal{L}_{\text{safety}}^{\text{cur}}(\bm{p}_i^{\text{pred}})
+\;=\;
+\softplus\bigl(d_{\text{safe}}^{\text{stat}} - \esdf_{m^*}(\bm{p}_i^{\text{pred}})\bigr).
+\end{equation}
+But the \emph{true} static obstacles in this sample live at positions
+$\{\bm{q}_j\}_{j}$ from the dynamic-bake's own pointcloud (a different forest).
+We are penalising the network for ``collisions'' that don't exist in this
+scene, and ignoring real collisions that do.
+
+\subsection{Decomposing the noise}
+
+Write the desired ``true'' supervision as
+$\mathcal{L}_{\text{safety}}^{\text{true}} = \softplus(d - \esdf_{\text{true}}(\bm{p}_i^{\text{pred}}))$.
+The expected gradient mismatch between current and true at a query point $\bm{p}$ is
+\begin{equation}\label{eq:mismatch}
+\bm{\eta}(\bm{p})
+\;=\;
+\mathbb{E}_{m^*}\!\Bigl[
+   \nabla_{\bm{p}} \mathcal{L}_{\text{safety}}^{\text{cur}}(\bm{p}) -
+   \nabla_{\bm{p}} \mathcal{L}_{\text{safety}}^{\text{true}}(\bm{p})
+\Bigr].
+\end{equation}
+If the static-forest distribution is sufficiently homogeneous (i.i.d.\ tree
+positions, same density), $\Norm{\mathbb{E}_{m^*}[\nabla \esdf_{m^*}]}$
+$\to 0$ as $E_{\text{static}} \to \infty$, so $\bm{\eta}$ has \emph{zero
+expected bias} --- but \emph{non-zero variance}. The variance shows up as
+gradient noise on every dynamic-batch step.
+
+For our v3 forests with $\rho_{\text{tree}}\!\approx\!0.05$ trees per m$^2$
+and $r_{\text{tree}}\!\approx\!0.3\,$m, the per-sample $\Norm{\nabla \esdf}$
+standard deviation is on the order of $\Norm{\nabla \esdf}_{\text{rms}} \approx 1$
+in regions away from the tree boundary, dropping to $\esdf$-sign-flip
+indicator near boundaries. The noise contribution to
+\texttt{stat\_traj\_tail} on dynamic batches is bounded but real.
+
+\section{Direct fix: bake the dynamic scene's own ESDF}
+
+Each \texttt{dataset\_dynamic/v$X$/env\_$E$/pointcloud.ply} already lives on
+disk. Computing an ESDF voxel grid from it is a standard one-time precomputation
+(use the same KdTree machinery \texttt{Simulator/}'s \texttt{maps.hpp} already
+employs). For $60{\times}60{\times}15$\,m at $0.1$\,m resolution this is
+$\sim$5.4\,M voxels per env; 40 envs $\to$ $\sim$216\,M voxels $\to$
+$\sim$1\,GB at float32. Acceptable.
+
+\subsection{Time-aware ESDF over the moving spheres}
+
+For full ``ESDF-time'' supervision (matching the formulation hinted at in
+\texttt{02\_multi\_waypoint\_extension.tex}), define
+\begin{equation}\label{eq:esdf-time}
+\esdf_{\text{full}}(\bm{p}, t)
+\;=\;
+\min\Bigl\{
+   \esdf_{\text{static}}(\bm{p}),
+   \;
+   \min_{m=1,\dots,M}
+   \bigl[\Norm{\bm{p} - \bm{p}_m^{\text{obs}}(t)} - r_m\bigr]
+\Bigr\},
+\end{equation}
+where $\bm{p}_m^{\text{obs}}(t) = \bm{p}_m^{\text{obs}}(0) + t\bm{v}_m^{\text{obs}}$
+(linear motion --- matches the bake). $\esdf_{\text{static}}$ is the precomputed
+static-cloud distance field. The full safety supervision becomes
+\begin{equation}\label{eq:safety-true}
+\mathcal{L}_{\text{safety}}^{\text{full}}(\bm{p}_i, t_i)
+\;=\;
+\softplus\bigl(d_{\text{safe}}^{\text{stat}} - \esdf_{\text{full}}(\bm{p}_i, t_i)\bigr).
+\end{equation}
+
+The gradient is well-defined wherever the inner $\min$ is unique --- in
+practice we use a smooth-min approximation
+$\widetilde{\min}_\beta(x_1, \dots, x_k) = -\beta^{-1}\log\sum_j e^{-\beta x_j}$
+with $\beta \sim 10$ to stabilise near the ``static vs. dynamic surface''
+boundary.
+
+\subsection{Gradient through the time argument}
+
+The trajectory's $t^{(n)}$ are differentiable functions of the network output
+(the time-head in \texttt{gru\_decoder.py} predicts them). Differentiating
+\eqref{eq:esdf-time} wrt $t$:
+\begin{equation}
+\frac{\partial \esdf_{\text{full}}}{\partial t}\Big|_{m^*}
+\;=\;
+\hat{\bm{u}}_{i,m^*} \cdot \bm{v}_{m^*}^{\text{obs}}
+\quad
+\text{(only at the dynamic minimum; static branch is }t\text{-independent)}.
+\end{equation}
+This gives the network a direct signal that ``shifting the waypoint timing
+moves you closer to or farther from the moving obstacle'', which neither the
+current \texttt{safety\_loss} nor the current \texttt{motion\_reshaped} alone
+provide.
+
+\section{Implementation cost}
+
+\begin{itemize}
+  \item \textbf{Bake-time:} add $\esdf_{\text{static}}$ precomputation as a
+        post-bake step in \texttt{Simulator/src/src/dataset\_generator.cpp};
+        ship as \texttt{esdf.bin} (binary float grid) alongside
+        \texttt{pointcloud.ply} per env. One-off cost; v3 already has the
+        pointcloud.
+  \item \textbf{Training-time:} new \texttt{policy/utils/esdf\_query.py} doing
+        trilinear interp on the float grid. CUDA kernel optional; for v3 we
+        can start with CPU since the env count is moderate.
+  \item \textbf{Loss replacement:} swap \texttt{YOPOLoss.safety\_loss}'s
+        \texttt{ESDFQuery} (which currently reads the \emph{static-dataset}
+        ESDF indexed by \texttt{map\_idx}) for the dynamic-scene-correct one.
+        Strict regression: when training on the static dataset
+        (\texttt{dynamic\_ratio=0}), the static-ESDF path is byte-identical
+        to today.
+\end{itemize}
+
+Estimated work: 3--4 days; this is the cheapest of the three supervision
+upgrades (compared to multi-waypoint head and camera-aware bake) but its
+expected impact is the smallest --- it fixes a gradient \emph{noise} source,
+not a structural saturation. Recommend doing it \emph{after} multi-waypoint to
+clean up the residual once Option B is in place.
+
+\section{Expected impact (back-of-envelope)}
+
+In the current setup the static-safety mismatch contributes a $\sim$5--10\%
+share of total dynamic-batch gradient norm. Eliminating that noise should
+reduce \texttt{stat\_traj\_tail} on dynamic batches by a similar fraction
+($\sim$$0.07$ absolute reduction from $\sim$$3.76$ to $\sim$$3.69$). It is
+\emph{unlikely} to move \texttt{dyn\_dyn} more than 1--2\% because the
+saturation argument in \texttt{01\_collision\_loss\_saturation.tex} is
+independent of this fix.
+
+\end{document}

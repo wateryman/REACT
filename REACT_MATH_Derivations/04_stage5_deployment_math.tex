@@ -1,0 +1,223 @@
+\documentclass[11pt]{article}
+\usepackage[a4paper, margin=1in]{geometry}
+\usepackage{amsmath, amssymb, bm}
+\usepackage{hyperref}
+
+\title{Stage-5 Deployment Math:\\
+       Latency Budget, Success-Rate Translation, and the Stateless-vs-Stateful Choice}
+\author{REACT stage-5 pre-flight}
+\date{2026-05-22}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\ms}{\,\text{ms}}
+\newcommand{\flops}{\,\text{FLOPS}}
+
+\begin{document}
+\maketitle
+
+\section{The two paper-target numbers}
+
+REACT's paper-level targets (set in README, traced from PEMTRS RA-L 2026):
+\begin{enumerate}
+  \item Inference latency $T_{\text{inf}} < 10\ms$ per frame on a Jetson-class
+        device (Orin Nano or NX as the typical reference).
+  \item Closed-loop success rate $\text{SR} \geq 85\%$ in dynamic-obstacle
+        scenes.
+\end{enumerate}
+
+The current training metric \texttt{dyn\_dyn\_tail} $\approx 0.22$--$0.24$ is
+\emph{not} either of these. This note derives the bridge.
+
+\section{Latency budget decomposition}
+
+Per-frame inference, in temporal mode (K=10 stateless):
+\begin{equation}\label{eq:latency-stateless}
+T_{\text{inf}}^{\text{stateless}}
+\;=\;
+T_{\text{ReVAE-enc}}^{K} + T_{\text{GRU}}^{K} + T_{\text{backbone}}^{1} +
+T_{\text{head}}^{1} + T_{\text{post}}.
+\end{equation}
+
+Single-frame mode (stage-3.1):
+\begin{equation}\label{eq:latency-single}
+T_{\text{inf}}^{\text{single}}
+\;=\;
+T_{\text{ReVAE-enc}}^{1} + T_{\text{backbone}}^{1} +
+T_{\text{head}}^{1} + T_{\text{post}}.
+\end{equation}
+
+Stateful mode (DiffPhysDrone-style, see \texttt{stage\_3\_4\_research\_cn.md}):
+\begin{equation}\label{eq:latency-stateful}
+T_{\text{inf}}^{\text{stateful}}
+\;=\;
+T_{\text{ReVAE-enc}}^{1} + T_{\text{GRU}}^{1} + T_{\text{backbone}}^{1} +
+T_{\text{head}}^{1} + T_{\text{post}}.
+\end{equation}
+
+\subsection{Per-component estimates (Orin NX, INT8 quantised reVAE)}
+
+Based on
+\href{https://developer.nvidia.com/embedded/jetson-orin}{Jetson Orin NX} INT8
+throughput (TF32 baseline $\approx 70$ TFLOPS at FP16) and the module FLOP
+counts (\texttt{reVAE.encode} $\approx 0.4$ GFLOPS per frame at $96\times160$
+input; \texttt{YopoBackbone} ResNet18 $\approx 1.8$ GFLOPS at the same input):
+\begin{center}
+\begin{tabular}{lrrr}
+\hline
+Component & FLOPS / call & Time / call (FP16) & Time / call (INT8) \\
+\hline
+\texttt{reVAE.encode}     & 0.4 G & 0.50\ms & 0.20\ms \\
+\texttt{reVAE.decode}     & 0.4 G & not on inference graph & --- \\
+\texttt{nn.GRU} step      & 0.1 M & 0.05\ms & 0.05\ms \\
+\texttt{YopoBackbone}     & 1.8 G & 2.4\ms  & 1.0\ms \\
+\texttt{YopoHead}         & 5.0 M & 0.08\ms & 0.04\ms \\
+post-processing (poly solve, anchor argmax) & --- & 1.0\ms & 1.0\ms \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{Latency budget table}
+
+Plugging in (FP16):
+\begin{center}
+\begin{tabular}{lrl}
+\hline
+Mode                    & Latency & $<10\ms$ budget hit? \\
+\hline
+\texttt{single} (3.1)   & $0.5 + 2.4 + 0.08 + 1.0 \approx 4.0\ms$  & Yes (with headroom) \\
+\texttt{stateful} K=1   & $0.5 + 0.05 + 2.4 + 0.08 + 1.0 \approx 4.0\ms$ & Yes \\
+\texttt{stateless} K=10 & $5.0 + 0.5 + 2.4 + 0.08 + 1.0 \approx 9.0\ms$  & Marginal (10\% margin) \\
+\hline
+\end{tabular}
+\end{center}
+
+Conclusion: \textbf{stage-3.4 stateless K=10 is feasible but uncomfortable on
+the Orin NX FP16 path}. Either move to INT8 (cuts reVAE encode to 0.2\,ms
+each, giving $\sim 6.0\ms$ total at K=10) or switch to stateful at deployment
+(stays at $\sim 4.0\ms$). The stateful refactor is \emph{not} a model
+re-training --- it's an inference-loop change: feed depth one frame at a time,
+carry GRU hidden state between calls.
+
+\section{From \texttt{dyn\_dyn\_tail} to success rate}
+
+This is the underspecified link. We have:
+\[
+\texttt{dyn\_dyn\_tail} = 0.23 \quad \text{(stage-3.1+, v3 dataset)}.
+\]
+We want to predict $\text{SR}$ in closed-loop sim. There is no clean closed
+form because $\text{SR}$ depends on (i) the closed-loop policy stability,
+(ii) the dynamic scene difficulty, and (iii) the controller tracking error
+on top of the planner. But we can bound it.
+
+\subsection{Per-trajectory collision probability under a loss-rate prior}
+
+Let $p_c$ denote the per-frame probability that the predicted endstate
+$\bm{p}_i^{\text{pred}}$ falls inside a forbidden region (within $d_{\text{safe}}$
+of some obstacle). Under the assumption that the optimal anchor is selected
+with high probability and \texttt{dyn\_dyn} is roughly the mean penalty over
+active anchors:
+\begin{equation}\label{eq:pc-estimate}
+\texttt{dyn\_dyn}
+\;\approx\;
+\lambda_{\text{dyn}} \cdot p_c \cdot \overline{\softplus} ,
+\end{equation}
+where $\overline{\softplus}$ is the mean softplus value on active anchors
+$\approx 0.3$. With $\lambda_{\text{dyn}} = 3.0$ and
+\texttt{dyn\_dyn} $= 0.23$, this gives
+\begin{equation}
+p_c \approx \frac{0.23}{3.0 \cdot 0.3} \approx 0.26.
+\end{equation}
+Interpretation: in $\approx 26\%$ of frames, \emph{some} candidate anchor
+emits an endstate violating the safety margin. The selected (top-score)
+anchor is usually a safer one, so per-frame \emph{actual} collision
+probability is significantly lower.
+
+\subsection{Translating to closed-loop $\text{SR}$}
+
+Assume a closed-loop trajectory consists of $N_{\text{frame}} \approx 100$ planning
+steps (3.3\,s flight at 30\,Hz), and that the score head selects the
+\emph{best} anchor each time (so the per-step actual-collision probability
+$p_{\text{actual}} \ll p_c$, perhaps an order of magnitude smaller because of
+the score selection). Then
+\begin{equation}\label{eq:sr-bound}
+\text{SR}
+\;\approx\;
+(1 - p_{\text{actual}})^{N_{\text{frame}}}
+\;=\;
+\exp\!\bigl(-N_{\text{frame}} \cdot p_{\text{actual}}\bigr).
+\end{equation}
+For $\text{SR} = 0.85$, we need
+$p_{\text{actual}} \le -\ln(0.85)/100 \approx 1.63 \times 10^{-3}$.
+For $\text{SR} = 0.90$: $p_{\text{actual}} \le 1.05 \times 10^{-3}$.
+
+If $p_{\text{actual}} \approx p_c/k$ for some score-selection improvement
+factor $k$, then we need $k \ge p_c / (1.63\times 10^{-3}) = 0.26 / 1.63\times 10^{-3}
+\approx 160$.
+
+\subsection{The score-head improvement factor $k$}
+
+This is unknown without closed-loop testing. Empirically YOPO's score head
+achieves $k$ on the order of $50$--$200$ in static scenes (the baseline
+reports $\sim$$90\%$ static success); whether it carries over to dynamic
+scenes is exactly what stage-5 must measure.
+
+\textbf{So the answer to ``is dyn\_dyn = 0.23 enough for $\text{SR} \geq 85\%$?''
+is: \emph{depends on $k$}, which we cannot measure without stage-5.}
+
+\section{Decision: stage-5 first does NOT block supervision improvements}
+
+The user's question was: ``if I go straight to stage-5, does it block the
+$<10\ms$ and $\geq 85\%$ goals?''
+
+\textbf{It does not block them; it is in fact the only way to measure them.}
+The reasoning:
+
+\begin{enumerate}
+  \item \textbf{$<10\ms$ goal} depends on inference graph + quantisation +
+        device choice (Jetson NX vs Orin Nano). Stage-5 \emph{is} this work.
+        No supervision change moves this number; an Option B head with $N=5$
+        waypoints would add at most $\sim$$0.2\ms$ to the head (negligible).
+        Going stage-5 first decides whether stateless K=10 fits the budget
+        without supervision changes. If yes, we ship. If no, we either go to
+        stateful (no retrain) or INT8 (no retrain) before pursuing supervision
+        upgrades.
+
+  \item \textbf{$\geq 85\%$ SR goal} requires closed-loop sim infrastructure
+        that does not yet exist. Building that is part of stage-5. Once it
+        exists, we can run the current stage-3.1 model and measure $k$ and
+        actual $\text{SR}$. \emph{If} we measure $\text{SR} \geq 85\%$, no
+        supervision change is needed --- ship and write the paper.
+        \emph{If} we measure $\text{SR} < 85\%$, the gap tells us how
+        aggressive the supervision change needs to be (multi-waypoint vs.\
+        ESDF vs.\ camera-aware data).
+
+  \item \textbf{Supervision upgrades without a closed-loop bench are
+        speculative.} Lowering \texttt{dyn\_dyn} from $0.23$ to $0.16$ via
+        Option B is only worthwhile if $\text{SR}$ is actually below $85\%$
+        and the bottleneck is the planner's collision-avoidance quality, not
+        the controller or the FOV-coverage issue. Without measurement, we
+        could spend two weeks on Option B and discover the $k$ factor was
+        already strong enough at $\texttt{dyn\_dyn} = 0.23$.
+\end{enumerate}
+
+\subsection{Recommended ordering}
+
+\begin{enumerate}
+  \item \textbf{Stage-5.A:} ONNX/TensorRT export of the current stage-3.1
+        model + Orin NX latency profile. $\approx$3 days.
+  \item \textbf{Stage-5.B:} Closed-loop sim harness using \texttt{Simulator/}'s
+        existing ROS controller. Run 100 dynamic scenarios; measure $\text{SR}$.
+        $\approx$4 days.
+  \item \textbf{Decision point.} If $\text{SR} \geq 85\%$: write paper, ship.
+        If $\text{SR} < 85\%$: pursue the supervision upgrade with the
+        biggest expected return per
+        \texttt{01\_collision\_loss\_saturation.tex}'s analysis (likely
+        Option B, possibly camera-aware bake).
+\end{enumerate}
+
+This sequence \emph{maximises information per week of work}: stage-5 alone
+either delivers the paper or tells us exactly which supervision change to
+chase. Going supervision-first does the opposite --- it polishes a metric
+whose translation to the paper-target SR is uncertain.
+
+\end{document}

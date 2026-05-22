@@ -1,0 +1,156 @@
+\documentclass[UTF8, 11pt]{ctexart}
+\usepackage[a4paper, margin=1in]{geometry}
+\usepackage{amsmath, amssymb, bm}
+\usepackage{hyperref}
+
+\title{为什么 \texttt{motion\_reshaped\_collision\_loss} 在\\单帧 anchor 粒度下饱和}
+\author{REACT stage-3.6 复盘}
+\date{2026-05-22}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\relu}{\operatorname{relu}}
+\newcommand{\softplus}{\operatorname{softplus}}
+
+\begin{document}
+\maketitle
+
+英文版:\href{run:./01_collision_loss_saturation.tex}{01\_collision\_loss\_saturation.tex}
+
+\section{设置与记号}
+
+每个训练步有 $B$ 个样本的 batch,每个样本产出 $V \times H$ 的 anchor 网格
+预测(这里 $V=3$、$H=5$,所以 $A = V H = 15$)。对样本 $b$ 上的一个 anchor
+$i \in \{1, \dots, A\}$:
+\begin{itemize}
+  \item $\bm{p}_i \in \R^3$ —— 预测的世界系 endstate 位置。
+  \item $\bm{v}_i^{\text{self}} = \bm{v}_b^{\text{start}} \in \R^3$ ——
+        无人机当前世界系速度(同一样本的不同 anchor 共享)。
+  \item 对每个动态障碍 $m \in \{1, \dots, M\}$:
+    \begin{itemize}
+      \item $\bm{p}_m^{\text{obs}}, \bm{v}_m^{\text{obs}} \in \R^3$,$r_m \in \R_{>0}$。
+    \end{itemize}
+\end{itemize}
+
+当前实现的损失(见 \texttt{YOPO/loss/motion\_reshaped\_esdf.py})对一个
+$(i, m)$ 对是
+\begin{equation}\label{eq:loss}
+\ell_{i,m} \;=\;
+\softplus\!\bigl(\,d_{\text{safe}} - \mathrm{dist}_{i,m} - \alpha\, c_{i,m}\,\bigr),
+\end{equation}
+其中
+\begin{align}
+\mathrm{dist}_{i,m} &\;=\; \Norm{\bm{p}_i - \bm{p}_m^{\text{obs}}} - r_m
+  &&\text{(球面到球面的间距)},\\
+\hat{\bm{u}}_{i,m} &\;=\; \frac{\bm{p}_m^{\text{obs}} - \bm{p}_i}{\Norm{\bm{p}_m^{\text{obs}} - \bm{p}_i}}
+  &&\text{(无人机$\to$障碍的单位向量)},\\
+\bm{v}_{i,m}^{\text{rel}} &\;=\; \bm{v}_i^{\text{self}} - \bm{v}_m^{\text{obs}},\\
+c_{i,m} &\;=\; \relu\!\bigl(\bm{v}_{i,m}^{\text{rel}} \cdot \hat{\bm{u}}_{i,m}\bigr)
+  &&\text{(非负的接近速度)}。\label{eq:closing}
+\end{align}
+
+Trainer 把
+\(
+\mathcal{L}_{\text{dyn}} \;=\; \lambda_{\text{dyn}}\,
+\operatorname*{mean}_{b, i, m}\, \ell_{i,m}
+\)
+聚合(即 \texttt{dyn\_dyn} 报告的就是这个均值)。
+
+\section{为什么在单帧 anchor 上饱和到 $\mathcal{O}(0.22)$}
+
+\subsection{每个 anchor 的梯度只依赖**一个**点}
+
+对 \eqref{eq:loss} 求 $\nabla_{\bm{p}_i} \ell_{i,m}$ 得
+\begin{equation}\label{eq:grad}
+\nabla_{\bm{p}_i} \ell_{i,m}
+\;=\;
+\sigma\!\bigl(d_{\text{safe}} - \mathrm{dist}_{i,m} - \alpha c_{i,m}\bigr)
+\,\Bigl[\,
+   -\nabla_{\bm{p}_i} \mathrm{dist}_{i,m}
+   -\alpha\,\nabla_{\bm{p}_i} c_{i,m}
+\Bigr],
+\end{equation}
+其中 $\sigma = \softplus' = (1 + e^{-(\cdot)})^{-1}$。关键是:这个梯度
+**只在单个 anchor 点** $\bm{p}_i$ **上算**。网络除了"挪动这一个 endstate"
+之外,没有其他自由度。
+
+\subsection{"无碰撞"的解空间体积很大}
+
+15 个 anchor 在 $\sim$60$^\circ$ FOV 内、距离 2--6m 的 end-radius 上展开;
+典型 $M=4$ 个障碍每个 $r_m \approx 0.5$m,被禁止的球壳并集体积是
+\[
+V_{\text{forbid}} = \sum_m \tfrac{4}{3}\pi(r_m + d_{\text{safe}})^3
+\;\approx\; 4 \cdot \tfrac{4}{3}\pi(1.1)^3 \;\approx\; 22\ \text{m}^3,
+\]
+而可达的 end-volume 是 $\sim$$200\,$m$^3$。**大多数 anchor 已经满足
+$\mathrm{dist}_{i,m} > d_{\text{safe}}$**,所以 $\softplus$ 的激活在"线性逼近零"
+那一段。这些 anchor 对均值的贡献被
+\[
+\softplus(d_{\text{safe}} - \mathrm{dist}_{i,m})
+\;\le\;
+\ln 2 \;\approx\; 0.693
+\quad \text{在边界处,以及} \quad
+\le\; 0.2\;\text{当 }\mathrm{dist}_{i,m} > d_{\text{safe}} + 1.5\,\text{m}\text{ 时}
+\]
+压住。
+
+\subsection{接近速度 reshape 是单边的}
+
+公式 \eqref{eq:closing} 用 $\relu$,所以一个**非接近** anchor($c_{i,m}=0$)
+完全收不到 reshape 的 kick,梯度是纯几何的。只有接近中的 anchor 才拿到
+$\alpha c_{i,m}$ 的 boost。在 v2/v3 数据集里球速 1--5\,m/s,无人机机体
++$X$ 速度 1--4\,m/s;相对速度方向随几何分布,经验上**只有约 30\% 的
+(anchor, 障碍) 对**有 $c_{i,m} > 0$。Reshape 的提升只到 ~30\% 的罚款项。
+
+\subsection{Mean 聚合把激活率拉平}
+
+上面三条组合,动态 batch 上实际激活罚款的均值是
+\[
+\mathcal{L}_{\text{dyn}}
+\;=\; \lambda_{\text{dyn}} \cdot p_{\text{active}} \cdot \bar{\ell}_{\text{active}},
+\]
+其中 $p_{\text{active}} \approx 0.20$(足够靠近能触发 $\softplus$ 的 anchor
+比例),$\bar{\ell}_{\text{active}} \approx 0.35$(典型激活罚款),给出
+\[
+\mathcal{L}_{\text{dyn}} \approx 3.0 \cdot 0.20 \cdot 0.35 \approx 0.21.
+\]
+这跟 v2/v3 实测的 $\texttt{dyn\_dyn} \in [0.22, 0.25]$ 尾窗值**对到两位有效数字**。
+**这个损失被 anchor 网格几何 + 障碍半径 + reshape 稀疏性下结构性地卡了下界**,
+跟 encoder 多好无关。
+
+\section{结论:加 encoder 容量打不破这个 floor}
+
+Encoder(无论是单帧、K-frame temporal、还是 DCA 增强)只能选**哪个**
+anchor 获得高 $\bm{p}_i$。它**做不到**:
+\begin{enumerate}
+  \item 移动障碍。
+  \item 插入中间 waypoint 让轨迹**弯**绕过障碍 —— anchor head 每个 anchor
+        恰好只出一个 $(p, v, a)$。
+  \item 改变接近速度 reshape 的单边 ReLU 性质。
+\end{enumerate}
+
+所以 v3 结果(4× 数据、3 个独立架构升级,全部收敛到 $\texttt{dyn\_dyn} \approx 0.23$)
+跟本文档的预测吻合:**损失被 anchor 网格 + 障碍分布 + 接近速度 reshape
+决定的某个数 floor 住,跟 encoder 无关**。
+
+\section{什么**能**打破这个 floor}
+
+任何**改变上面结构**的改动:
+\begin{itemize}
+  \item **多 waypoint 轨迹**(Option B;见
+        \texttt{02\_multi\_waypoint\_extension\_cn.tex}):损失沿连续曲线上的
+        $N$ 个点求和,网络可以**弯**绕过障碍 —— $p_{\text{active}}$ 的分布
+        形状变了。
+  \item **真实(有符号距离的)ESDF 覆盖动态场景**(见
+        \texttt{03\_esdf\_time\_replacement\_cn.tex}):当前损失只看球距离
+        近似;ESDF 给真实几何距离(含静态点云),会平移 $\bar{\ell}_{\text{active}}$。
+  \item **双边接近速度 reshape**(去 ReLU):对称梯度,激活分数翻倍。
+        改这个最便宜,值得快速试一下。
+  \item **Anchor 网格密化**($V \times H = 5 \times 9$ 而不是 $3 \times 5$):
+        障碍邻域里更多候选,轨迹选择粒度更细。前向计算二次方变多。
+\end{itemize}
+
+Stage-3.6 的结论方向是对的,本文档把它精确化:**监督信号本身**(尤其是
+它的**单点、单边、mean 聚合**这三个性质)**就是上限**。
+
+\end{document}

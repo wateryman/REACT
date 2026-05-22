@@ -1,0 +1,154 @@
+\documentclass[UTF8, 11pt]{ctexart}
+\usepackage[a4paper, margin=1in]{geometry}
+\usepackage{amsmath, amssymb, bm}
+\usepackage{hyperref}
+
+\title{多 Waypoint 扩展(Option B):\\
+       每 anchor 加 $N$ 个 waypoint 如何激活 kinodynamic 监督}
+\author{REACT stage-3.7 候选设计}
+\date{2026-05-22}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\relu}{\operatorname{relu}}
+\newcommand{\softplus}{\operatorname{softplus}}
+
+\begin{document}
+\maketitle
+
+英文版:\href{run:./02_multi_waypoint_extension.tex}{02\_multi\_waypoint\_extension.tex}
+
+\section{为什么 Option A 让 \texttt{dyn\_kino} 一直休眠}
+
+Stage-3.4 Option A 保留 anchor-grid head,每个 anchor 只预测**一个** endstate
+$(p, v, a) \in \R^9$。kinodynamic 损失
+\begin{equation}\label{eq:kino-anchor}
+\mathcal{L}_{\text{kino}}^{\text{single}}
+\;=\; \lambda_{\text{kino}}\!\left[
+   \relu(\Norm{\bm{v}_i} - v_{\max})^2 +
+   \relu(\Norm{\bm{a}_i} - a_{\max})^2
+\right]
+\end{equation}
+只在 endstate 上算。经验上网络 endstate 的 $\Norm{\bm{v}_i}$ 远低于
+$v_{\max}=8\,$m/s(数据集轨迹是机体系 1--4\,m/s),$\Norm{\bm{a}_i}$
+几乎不靠近 $a_{\max}=10\,$m/s$^2$。jerk 项 $\relu(\Norm{\bm{j}_i}-j_{\max})^2$
+完全被去掉,因为单 endstate 算不出 jerk。
+
+2k+5k+v3 三次跑全部报告 \texttt{dyn\_kino\_tail} $\in [10^{-4}, 10^{-3}]$ ——
+**损失接上了但不工作**。
+
+\section{多 Waypoint 重参数化}
+
+Option B 把每 anchor 的标量 head 替换成序列 emitter。每个 anchor $i$
+输出 $N$ 个 waypoint
+\(
+\{\bm{w}_i^{(n)}\}_{n=1}^{N},
+\quad
+\bm{w}_i^{(n)} = (\bm{p}_i^{(n)}, \bm{v}_i^{(n)}, \bm{a}_i^{(n)}) \in \R^9,
+\)
+外加时间向量 $\{t_i^{(n)}\}_{n=1}^N$,给出轨迹的采样时间戳(PEMTRS 用
+$t_i^{(n)} = n \cdot \mathrm{dt}$ 这种固定 $\mathrm{dt}$)。建议复用 stage-1
+已经写好但**未接图**的 \texttt{policy/models/gru\_decoder.py},它输出的
+就是这个 shape。
+
+\subsection{差分得 jerk}
+
+$N \geq 4$ 时可以对 $\bm{a}_i^{(n)}$ 差分得 $\bm{j}_i^{(n)}$:
+\begin{equation}
+\bm{j}_i^{(n)}
+\;=\;
+\frac{\bm{a}_i^{(n+1)} - \bm{a}_i^{(n)}}{t_i^{(n+1)} - t_i^{(n)}},
+\quad n = 1, \dots, N-1.
+\end{equation}
+完整 kinodynamic 损失变成
+\begin{equation}\label{eq:kino-multi}
+\mathcal{L}_{\text{kino}}^{\text{multi}}
+\;=\;
+\lambda_{\text{kino}}
+\cdot
+\frac{1}{N}\!\sum_{n=1}^{N}\!\!
+\Bigl[
+   \relu\bigl(\Norm{\bm{v}_i^{(n)}} - v_{\max}\bigr)^2 \!+
+   \relu\bigl(\Norm{\bm{a}_i^{(n)}} - a_{\max}\bigr)^2
+\Bigr]
++ \lambda_{\text{kino}} \cdot \frac{1}{N-1} \!\sum_{n=1}^{N-1}\!\!
+   \relu\bigl(\Norm{\bm{j}_i^{(n)}} - j_{\max}\bigr)^2.
+\end{equation}
+
+因为相邻 waypoint 可以有非常不同的 $(\bm{v}, \bm{a})$ —— 网络有 $N$ 个自由度
+而不是 1 个 —— $\mathcal{L}_{\text{kino}}^{\text{multi}}$ 从随机初始化就**激活**,
+梯度推动**整条轨迹**(不只是 endstate)进入可行包络。
+
+\subsection{沿轨迹求和的 collision loss}
+
+motion-reshaped collision loss 类似地推广:
+\begin{equation}\label{eq:coll-multi}
+\mathcal{L}_{\text{coll}}^{\text{multi}}
+\;=\;
+\lambda_{\text{dyn}}
+\cdot
+\frac{1}{N M} \!\sum_{n=1}^{N} \sum_{m=1}^{M}
+\softplus\!\bigl(d_{\text{safe}} - \mathrm{dist}_{i,m}^{(n)} -\alpha\, c_{i,m}^{(n)}\bigr),
+\end{equation}
+$\mathrm{dist}^{(n)}, c^{(n)}$ 在 $\bm{w}_i^{(n)}$ 和**时刻 $t^{(n)}$ 的障碍位置**
+上算:
+\(
+\bm{p}_m^{\text{obs}}(t^{(n)}) = \bm{p}_m^{\text{obs}}(0) + t^{(n)}\,\bm{v}_m^{\text{obs}}.
+\)
+这是 bake 出的逐帧 \texttt{dyn\_obs.json}(目前大部分没用上)第一次真正发挥作用
+—— 我们现在需要球在**所有 $N$ 个 waypoint 时刻**的位置,不只是当前帧。
+
+\section{为什么这能打破 ~1\% 天花板}
+
+三个结构性改变把
+\texttt{01\_collision\_loss\_saturation\_cn.tex} 的饱和 argument 翻过来:
+
+\begin{enumerate}
+  \item **$p_{\text{active}}$ 上升**。多 waypoint 轨迹经过障碍附近时,
+        现在**每个**靠近的 $n$ 都触发 $\softplus$ —— 一次近碰撞被路径长度
+        放大,激活罚款均值从 $\sim$$0.20$ 升到 $\sim$$0.50$。
+  \item **网络有曲率 DoF**。Waypoint 序列可以**弯**绕障碍,梯度
+        $\nabla \mathcal{L}_{\text{coll}}^{\text{multi}}$ 是 $N$ 个点梯度而不是 1 个,
+        优化器有多种降低损失的方式。
+  \item **Kinodynamic loss 激活**。如上所述,jerk 和中间 velocity/acceleration
+        罚款全部醒过来,给一个单 anchor head 给不了的正则化压力。
+  \end{enumerate}
+
+\section{实现代价估计}
+
+换 head 涉及:
+\begin{itemize}
+  \item \texttt{policy/models/gru\_decoder.py} —— stage-1 已经写好,未接图。
+        **不需要新模块**。
+  \item \texttt{policy/yopo\_network.py::forward} —— Option B 模式下把
+        \texttt{YopoHead} 换成 \texttt{GRUDecoder}。Shape 契约从
+        $(B, 9, V, H)$ 变成 $(B, A, N, 9)$。
+  \item \texttt{policy/yopo\_trainer.py::forward\_and\_compute\_loss}
+        约 256--320 行 —— 把 \texttt{end\_pos\_w, end\_state\_w} 从
+        $(BVH, 3)$ 扩到 $(BVH N, 3)$,重新路由损失聚合。如果 head 出
+        polynomial 系数就复用 \texttt{poly\_solver.py};否则直接 emit
+        waypoint 省掉 solver 步骤。
+  \item 四个 loss 文件(\texttt{motion\_reshaped\_esdf.py}、
+        \texttt{kinodynamic\_loss.py}、\texttt{smoothness\_loss.py}、
+        \texttt{safety\_loss.py})都要做 shape 审计 —— 每个都要接受
+        $(BVH N, \cdot)$ 形状。
+\end{itemize}
+
+总工作量估计:**5--7 个工作日**,瓶颈是损失审计和多 waypoint baseline 重跑。
+**比 path-a 风险高**,因为动到了 stable regression 数字所在的 loss 代码;
+缓解措施是用跟 stage-3.4 一样的字节级回退 flag 模式
+(\texttt{cfg.head\_kind}: \texttt{anchor} 或 \texttt{multi\_wp},默认
+\texttt{anchor})。
+
+\section{要测试的假设}
+
+\begin{quote}
+  在 v3 规模(8000 seq)下,带 $N=5$ 和损失 \eqref{eq:kino-multi}--\eqref{eq:coll-multi}
+  的 Option B 多 waypoint head 把 \texttt{dyn\_dyn\_tail} 至少**降 30\%**
+  (目标 $\le 0.16$),并把 \texttt{dyn\_kino\_tail} 激活到 $0.01$ 以上。
+\end{quote}
+
+如果 Option B 下 \texttt{dyn\_kino\_tail} 仍然 $\sim$0,那是 kinodynamic 包络
+本身太宽松,需要收紧(例如 $v_{\max}=4$ 跟数据分布对齐)。
+
+\end{document}

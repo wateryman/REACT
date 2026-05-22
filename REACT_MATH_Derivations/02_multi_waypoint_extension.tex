@@ -1,0 +1,165 @@
+\documentclass[11pt]{article}
+\usepackage[a4paper, margin=1in]{geometry}
+\usepackage{amsmath, amssymb, bm}
+\usepackage{hyperref}
+
+\title{Multi-Waypoint Extension (Option B):\\
+       How Adding $N$ Waypoints Per Anchor Activates Kinodynamic Supervision}
+\author{REACT stage-3.7 design candidate}
+\date{2026-05-22}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\relu}{\operatorname{relu}}
+\newcommand{\softplus}{\operatorname{softplus}}
+
+\begin{document}
+\maketitle
+
+\section{Why Option A keeps \texttt{dyn\_kino} dormant}
+
+Stage-3.4 Option A keeps the anchor-grid head and predicts \emph{one} endstate
+$(p, v, a) \in \R^9$ per anchor. The kinodynamic loss
+\begin{equation}\label{eq:kino-anchor}
+\mathcal{L}_{\text{kino}}^{\text{single}}
+\;=\; \lambda_{\text{kino}}\!\left[
+   \relu(\Norm{\bm{v}_i} - v_{\max})^2 +
+   \relu(\Norm{\bm{a}_i} - a_{\max})^2
+\right]
+\end{equation}
+evaluates only at the endstate. Empirically the network's endstate $\Norm{\bm{v}_i}$
+stays comfortably below $v_{\max}=8\,$m/s (the dataset trajectories are at
+1--4\,m/s body-frame), and $\Norm{\bm{a}_i}$ rarely approaches $a_{\max}=10\,$m/s$^2$.
+The jerk term $\relu(\Norm{\bm{j}_i}-j_{\max})^2$ is dropped entirely because
+a single endstate gives no jerk.
+
+The 2k+5k+v3 runs all report \texttt{dyn\_kino\_tail} $\in [10^{-4}, 10^{-3}]$ ---
+the loss is wired but \emph{inactive}.
+
+\section{Multi-waypoint reparameterisation}
+
+Option B replaces the per-anchor scalar head with a sequence emitter. For each
+anchor $i$ the network outputs $N$ waypoints
+\(
+\{\bm{w}_i^{(n)}\}_{n=1}^{N},
+\quad
+\bm{w}_i^{(n)} = (\bm{p}_i^{(n)}, \bm{v}_i^{(n)}, \bm{a}_i^{(n)}) \in \R^9,
+\)
+plus a time-vector $\{t_i^{(n)}\}_{n=1}^N$ giving the timestamps at which the
+trajectory is sampled (PEMTRS uses $t_i^{(n)} = n \cdot \mathrm{dt}$ for fixed
+$\mathrm{dt}$). The proposed implementation reuses the existing
+\texttt{policy/models/gru\_decoder.py} (built stage-1, currently unwired) which
+emits exactly this shape.
+
+\subsection{Differentiated finite-difference jerk}
+
+With $N \geq 4$ waypoints we can finite-difference $\bm{a}_i^{(n)}$ to recover
+$\bm{j}_i^{(n)}$:
+\begin{equation}
+\bm{j}_i^{(n)}
+\;=\;
+\frac{\bm{a}_i^{(n+1)} - \bm{a}_i^{(n)}}{t_i^{(n+1)} - t_i^{(n)}},
+\quad n = 1, \dots, N-1.
+\end{equation}
+The full kinodynamic loss now becomes
+\begin{equation}\label{eq:kino-multi}
+\mathcal{L}_{\text{kino}}^{\text{multi}}
+\;=\;
+\lambda_{\text{kino}}
+\cdot
+\frac{1}{N}\!\sum_{n=1}^{N}\!\!
+\Bigl[
+   \relu\bigl(\Norm{\bm{v}_i^{(n)}} - v_{\max}\bigr)^2 \!+
+   \relu\bigl(\Norm{\bm{a}_i^{(n)}} - a_{\max}\bigr)^2
+\Bigr]
++ \lambda_{\text{kino}} \cdot \frac{1}{N-1} \!\sum_{n=1}^{N-1}\!\!
+   \relu\bigl(\Norm{\bm{j}_i^{(n)}} - j_{\max}\bigr)^2.
+\end{equation}
+
+Because successive waypoints can in principle have very different
+$(\bm{v}, \bm{a})$ values --- the network has $N$ degrees of freedom rather than 1 ---
+$\mathcal{L}_{\text{kino}}^{\text{multi}}$ becomes active at random
+initialisation, and the gradient pushes the entire \emph{trajectory}, not just
+the endstate, into the feasible envelope.
+
+\subsection{Collision loss summed over the trajectory}
+
+The motion-reshaped collision loss generalises analogously:
+\begin{equation}\label{eq:coll-multi}
+\mathcal{L}_{\text{coll}}^{\text{multi}}
+\;=\;
+\lambda_{\text{dyn}}
+\cdot
+\frac{1}{N M} \!\sum_{n=1}^{N} \sum_{m=1}^{M}
+\softplus\!\bigl(d_{\text{safe}} - \mathrm{dist}_{i,m}^{(n)} -\alpha\, c_{i,m}^{(n)}\bigr),
+\end{equation}
+with $\mathrm{dist}^{(n)}, c^{(n)}$ computed at $\bm{w}_i^{(n)}$ and the obstacle
+position \emph{at time} $t^{(n)}$:
+\(
+\bm{p}_m^{\text{obs}}(t^{(n)}) = \bm{p}_m^{\text{obs}}(0) + t^{(n)}\,\bm{v}_m^{\text{obs}}.
+\)
+This is the first place the bake's per-frame \texttt{dyn\_obs.json} data
+(currently mostly unused) earns its keep --- we now need ball positions across
+\emph{all $N$ waypoint times}, not just the current frame.
+
+\section{Why this should break the $\sim$1\% ceiling}
+
+Three structural changes flip the saturation argument from
+\texttt{01\_collision\_loss\_saturation.tex}:
+
+\begin{enumerate}
+  \item \textbf{$p_{\text{active}}$ rises.} A multi-waypoint trajectory passing
+        near an obstacle now triggers $\softplus$ at every $n$ where the
+        trajectory is close --- a single near-collision is amplified by the
+        path length, raising the active-penalty mean from $\sim$$0.20$ to
+        $\sim$$0.50$.
+  \item \textbf{Network has curvature DoF.} A waypoint sequence can
+        \emph{curve} around obstacles, so the gradient
+        $\nabla \mathcal{L}_{\text{coll}}^{\text{multi}}$ has $N$ point gradients
+        instead of one, giving the optimizer multiple ways to reduce the loss.
+  \item \textbf{Kinodynamic loss activates.} As described above, jerk and
+        intermediate velocity/acceleration penalties wake up, providing a
+        regularisation pressure the single-anchor head couldn't supply.
+\end{enumerate}
+
+\section{Implementation cost (estimate)}
+
+Replacing the head touches:
+\begin{itemize}
+  \item \texttt{policy/models/gru\_decoder.py} -- already exists from stage-1,
+        unwired. \textbf{No new module.}
+  \item \texttt{policy/yopo\_network.py::forward} -- swap \texttt{YopoHead}
+        for \texttt{GRUDecoder} when in Option B mode. Shape contract becomes
+        $(B, A, N, 9)$ instead of $(B, 9, V, H)$.
+  \item \texttt{policy/yopo\_trainer.py::forward\_and\_compute\_loss}, lines
+        $\sim$256--320 -- expand \texttt{end\_pos\_w, end\_state\_w} from
+        $(BVH, 3)$ to $(BVH N, 3)$ and re-route the loss aggregation. The
+        \texttt{poly\_solver.py} primitive evaluator can be reused if the head
+        emits polynomial coefficients; otherwise direct waypoint emission saves
+        the solver step.
+  \item All four loss files (\texttt{motion\_reshaped\_esdf.py},
+        \texttt{kinodynamic\_loss.py}, \texttt{smoothness\_loss.py},
+        \texttt{safety\_loss.py}) need shape audits -- each must accept
+        $(BVH N, \cdot)$ shapes.
+\end{itemize}
+
+Total work estimate: $\sim$5--7 working days, dominated by loss audit and
+multi-waypoint baseline run. \textbf{Higher risk than path-a} because it touches
+loss code that has stable regression numbers; mitigation is the same byte-clean
+fallback flag pattern used in stage-3.4 (\texttt{cfg.head\_kind}: \texttt{anchor}
+or \texttt{multi\_wp}, default \texttt{anchor}).
+
+\section{Hypothesis to test}
+
+\begin{quote}
+  \emph{At v3 scale (8000 seq), an Option-B multi-waypoint head with $N=5$ and
+  the loss \eqref{eq:kino-multi}--\eqref{eq:coll-multi} reduces
+  \texttt{dyn\_dyn\_tail} by at least 30\% (target $\le 0.16$), and activates
+  \texttt{dyn\_kino\_tail} above $0.01$.}
+\end{quote}
+
+If \texttt{dyn\_kino\_tail} stays at $\sim$0 with Option B, the kinodynamic
+envelope itself is too loose and needs tightening (e.g., $v_{\max}=4$ to match
+the data distribution).
+
+\end{document}
