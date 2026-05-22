@@ -1,0 +1,33 @@
+# REACT 数学推导
+
+本目录收录 REACT 在 stage-3.6 之后所有"为什么这样写、为什么不这样写"的数学推导。
+每个 `.tex` 文件**自包含**(自带 preamble),可以单独 `pdflatex` 编译,也可以
+直接在 GitHub 上阅读 source。
+
+## 文件清单
+
+| 文件 | 内容 | 写作时机 |
+|---|---|---|
+| [01_collision_loss_saturation.tex](01_collision_loss_saturation.tex) | 为什么当前 motion_reshaped_collision_loss 在 single-frame anchor 形态下饱和(stage-3.6 v3 的 ~1% 天花板的数学解释) | stage-3.6 后 |
+| [02_multi_waypoint_extension.tex](02_multi_waypoint_extension.tex) | Option B(多 waypoint GRU decoder)如何把损失从 per-anchor 推广到 per-waypoint;kinodynamic 损失为何在多 waypoint 下"真正激活" | stage-3.6 后 |
+| [03_esdf_time_replacement.tex](03_esdf_time_replacement.tex) | 把 stage-3.1 `random map_idx` 捷径换成真实动态场景 ESDF 的推导;时空 ESDF 的梯度 | stage-3.6 后 |
+| [04_stage5_deployment_math.tex](04_stage5_deployment_math.tex) | <10 ms 推理延迟预算分解;K=10 stateless vs stateful GRU 的延迟数学;≥85% 成功率与 dyn_dyn 的(假设)关系 | stage-3.6 后 |
+
+## 引用规范
+
+所有公式用 PEMTRS RA-L 2026 论文里的记号(向量小写粗体,矩阵大写,空间索引下标)。
+
+引用上游 YOPO 论文(IEEE RA-L 2024)和 PEMTRS RA-L 2026 的公式编号时,用
+`\cite{yopo2024}` / `\cite{pemtrs2026}`。
+
+## 编译
+
+```bash
+cd REACT_MATH_Derivations
+pdflatex 01_collision_loss_saturation.tex   # 单文件
+# 或 mass-compile:
+for f in *.tex; do pdflatex "$f"; done
+```
+
+LaTeX 依赖: `amsmath`, `amssymb`, `bm`, `algorithm`, `algorithmic`, `hyperref`,
+`geometry`(标准 TeX Live full install 都自带)。

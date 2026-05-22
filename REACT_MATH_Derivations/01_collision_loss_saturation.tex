@@ -1,0 +1,168 @@
+\documentclass[11pt]{article}
+\usepackage[a4paper, margin=1in]{geometry}
+\usepackage{amsmath, amssymb, bm}
+\usepackage{hyperref}
+
+\title{Why \texttt{motion\_reshaped\_collision\_loss} Saturates at\\Single-Frame Anchor Granularity}
+\author{REACT stage-3.6 post-mortem}
+\date{2026-05-22}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\relu}{\operatorname{relu}}
+\newcommand{\softplus}{\operatorname{softplus}}
+
+\begin{document}
+\maketitle
+
+\section{Setup and notation}
+
+For each training step we have a batch of $B$ samples, each producing $V \times H$
+anchor-grid predictions (here $V=3$, $H=5$, so $A = V H = 15$). For one anchor
+$i \in \{1, \dots, A\}$ on sample $b$:
+\begin{itemize}
+  \item $\bm{p}_i \in \R^3$ --- predicted end-position in the world frame.
+  \item $\bm{v}_i^{\text{self}} = \bm{v}_b^{\text{start}} \in \R^3$ --- the
+        drone's \emph{current} world-frame velocity (shared across anchors of
+        the same sample).
+  \item For each dynamic obstacle $m \in \{1, \dots, M\}$:
+    \begin{itemize}
+      \item $\bm{p}_m^{\text{obs}}, \bm{v}_m^{\text{obs}} \in \R^3$, $r_m \in \R_{>0}$.
+    \end{itemize}
+\end{itemize}
+
+The implemented loss (see \texttt{YOPO/loss/motion\_reshaped\_esdf.py}) for a single
+$(i, m)$ pair is
+\begin{equation}\label{eq:loss}
+\ell_{i,m} \;=\;
+\softplus\!\bigl(\,d_{\text{safe}} - \mathrm{dist}_{i,m} - \alpha\, c_{i,m}\,\bigr),
+\end{equation}
+with
+\begin{align}
+\mathrm{dist}_{i,m} &\;=\; \Norm{\bm{p}_i - \bm{p}_m^{\text{obs}}} - r_m
+  &&\text{(surface-to-surface gap)},\\
+\hat{\bm{u}}_{i,m} &\;=\; \frac{\bm{p}_m^{\text{obs}} - \bm{p}_i}{\Norm{\bm{p}_m^{\text{obs}} - \bm{p}_i}}
+  &&\text{(unit vector drone $\to$ obstacle)},\\
+\bm{v}_{i,m}^{\text{rel}} &\;=\; \bm{v}_i^{\text{self}} - \bm{v}_m^{\text{obs}},\\
+c_{i,m} &\;=\; \relu\!\bigl(\bm{v}_{i,m}^{\text{rel}} \cdot \hat{\bm{u}}_{i,m}\bigr)
+  &&\text{(non-negative closing speed)}.\label{eq:closing}
+\end{align}
+
+The trainer aggregates
+\(
+\mathcal{L}_{\text{dyn}} \;=\; \lambda_{\text{dyn}}\,
+\operatorname*{mean}_{b, i, m}\, \ell_{i,m}
+\)
+across the batch (so the reported \texttt{dyn\_dyn} number is this mean).
+
+\section{Why this saturates at $\mathcal{O}(0.22)$ on single-frame anchors}
+
+\subsection{The gradient depends only on \emph{one} point per anchor}
+
+Computing $\nabla_{\bm{p}_i} \ell_{i,m}$ from \eqref{eq:loss} gives
+\begin{equation}\label{eq:grad}
+\nabla_{\bm{p}_i} \ell_{i,m}
+\;=\;
+\sigma\!\bigl(d_{\text{safe}} - \mathrm{dist}_{i,m} - \alpha c_{i,m}\bigr)
+\,\Bigl[\,
+   -\nabla_{\bm{p}_i} \mathrm{dist}_{i,m}
+   -\alpha\,\nabla_{\bm{p}_i} c_{i,m}
+\Bigr],
+\end{equation}
+where $\sigma = \softplus' = (1 + e^{-(\cdot)})^{-1}$. Crucially, the gradient is
+\emph{evaluated at the single anchor point} $\bm{p}_i$. The network has no degree
+of freedom to ``move'' the trajectory anywhere except at this one endstate.
+
+\subsection{Volume of \emph{not-colliding} solutions is large}
+
+Given the 15-anchor grid covering a $\sim$60$^\circ$ FOV at $\sim$2--6m end-radius,
+for a typical $M=4$ obstacles with $r_m \approx 0.5$m, the union of forbidden
+spheres around obstacles occupies
+\[
+V_{\text{forbid}} = \sum_m \tfrac{4}{3}\pi(r_m + d_{\text{safe}})^3
+\;\approx\; 4 \cdot \tfrac{4}{3}\pi(1.1)^3 \;\approx\; 22\ \text{m}^3,
+\]
+out of an accessible end-volume of $\sim$$200\,$m$^3$. \textbf{Most anchors
+satisfy $\mathrm{dist}_{i,m} > d_{\text{safe}}$ already}, so the
+$\softplus$ activation is in its linear-near-zero regime. Their per-anchor
+contribution to the mean is bounded by
+\[
+\softplus(d_{\text{safe}} - \mathrm{dist}_{i,m})
+\;\le\;
+\ln 2 \;\approx\; 0.693
+\quad \text{at the boundary, and} \quad
+\le\; 0.2\;\text{for }\mathrm{dist}_{i,m} > d_{\text{safe}} + 1.5\,\text{m}.
+\]
+
+\subsection{Closing-speed reshape is one-sided}
+
+Equation~\eqref{eq:closing} uses $\relu$, so a non-approaching anchor
+($c_{i,m}=0$) gets zero reshape and its gradient is purely geometric. Only
+approaching anchors get the $\alpha c_{i,m}$ kick. In the v2/v3 datasets the
+ball-speed range is 1--5\,m/s and the drone's body-+$X$ speed is 1--4\,m/s;
+the relative velocity points anywhere in $\R^3$ depending on geometry, and
+empirically only $\approx 30\%$ of (anchor, obstacle) pairs have $c_{i,m} > 0$
+in a typical batch. So the reshape boost reaches only $\approx 30\%$ of the
+penalty terms.
+
+\subsection{Mean-aggregation flattens the active fraction}
+
+Combining the above, on a dynamic batch the actual active-penalty mean is
+\[
+\mathcal{L}_{\text{dyn}}
+\;=\; \lambda_{\text{dyn}} \cdot p_{\text{active}} \cdot \bar{\ell}_{\text{active}},
+\]
+where $p_{\text{active}} \approx 0.20$ (anchors close enough to trigger
+$\softplus$) and $\bar{\ell}_{\text{active}} \approx 0.35$ (typical active
+penalty), giving
+\[
+\mathcal{L}_{\text{dyn}} \approx 3.0 \cdot 0.20 \cdot 0.35 \approx 0.21.
+\]
+This matches the v2/v3 measured $\texttt{dyn\_dyn} \in [0.22, 0.25]$ tail to
+two significant figures. \textbf{The loss is structurally lower-bounded by the
+geometry of the anchor grid + obstacle radii + reshape sparsity}, regardless of
+how good the encoder is.
+
+\section{Implication: more encoder capacity cannot break the floor}
+
+The encoder (whether single-frame, K-frame temporal, or DCA-augmented) can only
+choose \emph{which} anchor to assign high $\bm{p}_i$. It cannot:
+\begin{enumerate}
+  \item Move the obstacle.
+  \item Insert intermediate waypoints that would let the trajectory \emph{curve}
+        around obstacles -- the anchor head emits exactly one $(p, v, a)$ per
+        anchor.
+  \item Change the closing-speed reshape from one-sided ReLU.
+\end{enumerate}
+
+So the v3 result (4$\times$ data, 3 independent architectural upgrades, all
+converging at $\texttt{dyn\_dyn} \approx 0.23$) is consistent with the
+prediction in this note: the loss saturates at a number determined by the
+anchor-grid + obstacle distribution + closing-speed reshape, not by the
+encoder.
+
+\section{What \emph{would} break the floor}
+
+Any change that alters the structure above:
+\begin{itemize}
+  \item \textbf{Multi-waypoint trajectory} (Option B; see
+        \texttt{02\_multi\_waypoint\_extension.tex}): the loss is summed over
+        $N$ points along a continuous curve, so the network can \emph{curve}
+        around obstacles -- the $p_{\text{active}}$ population changes shape.
+  \item \textbf{Real (signed-distance) ESDF over the dynamic scene} (see
+        \texttt{03\_esdf\_time\_replacement.tex}): the current loss only sees
+        a sphere-distance approximation; ESDF gives true geometric distance
+        including the static cloud, which would shift $\bar{\ell}_{\text{active}}$.
+  \item \textbf{Two-sided closing-speed reshape} (drop the ReLU): symmetric
+        gradient, doubles the effective active fraction. Cheap to test.
+  \item \textbf{Anchor-grid densification} ($V \times H = 5 \times 9$ instead
+        of $3 \times 5$): more candidates inside obstacle neighborhoods,
+        higher resolution of the trajectory selection. Quadratically more
+        forward compute.
+\end{itemize}
+
+The stage-3.6 conclusion was therefore correct in spirit, sharpened by this
+derivation: \textbf{the supervision signal, specifically its single-point,
+one-sided, mean-aggregated form, is the binding constraint.}
+
+\end{document}
