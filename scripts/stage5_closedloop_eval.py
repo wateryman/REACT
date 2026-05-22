@@ -1,8 +1,14 @@
-"""Stage-5.B.2 — closed-loop SR evaluation driver (point-mass dynamics).
+"""Stage-5.B.2 — closed-loop SR evaluation driver.
 
 Connects to a running sensor_simulator ROS node (stage-5.B.1 dynamic-sphere
 support required), drives 100 scenarios from tools/eval_scenarios/v3_dyn_100/,
 and measures closed-loop success rate.
+
+Two integrator options via --dynamics:
+  point_mass : Pass-1, bounded double integrator (planner SR upper bound).
+  poly5      : Pass-2, 5th-order polynomial per axis -- matches the deployed
+               Poly5Solver in YOPO/test_yopo_ros.py.  Use this number for
+               anything you cite alongside the real-flight target.
 
 Pipeline per scenario, 30 Hz:
   1. Step balls in Python (linear motion + bbox reflection).
@@ -46,6 +52,7 @@ sys.path.insert(0, YOPO_DIR)
 from config.config import cfg
 from policy.yopo_network import YopoNetwork
 from policy.state_transform import StateTransform
+from policy.poly_solver import Poly5Solver
 
 import rospy
 import cv2
@@ -292,25 +299,51 @@ def run_scenario(scenario, bridge, planner, args):
                     "mean_speed": float(np.mean(speeds)) if speeds else 0.0}
         # 4. plan
         plan = planner.plan(depth, pos, rot_wc, vel, acc, goal)
-        # 5. point-mass step: follow predicted velocity, advance pos
+        # 5. step drone state.  Two modes:
         target_pos = plan["end_pos_w"]
+        target_vel = plan["end_vel_w"]
+        target_acc = plan["end_acc_w"]
         traj_time = float(cfg["sgm_time"])   # ~1.7s endstate horizon
-        # next velocity = (target - current) / traj_time, but clipped to v_max
-        v_max = float(cfg["vel_max_train"])
-        v_desired = (target_pos - pos) / max(traj_time, 1e-3)
-        v_norm = float(np.linalg.norm(v_desired))
-        if v_norm > v_max:
-            v_desired = v_desired * (v_max / v_norm)
-        # crude acceleration limit
-        a_max = float(cfg["acc_max_train"])
-        dv = v_desired - vel
-        dv_norm = float(np.linalg.norm(dv))
-        if dv_norm > a_max * dt:
-            dv = dv * (a_max * dt / dv_norm)
-        vel = vel + dv
-        acc = dv / dt
-        # 6. integrate
-        pos = pos + vel * dt
+
+        if args.dynamics == "point_mass":
+            # Pass-1: bounded double-integrator.  Cheap upper bound on
+            # planner SR; ignores trajectory shape between waypoints.
+            v_max = float(cfg["vel_max_train"])
+            v_desired = (target_pos - pos) / max(traj_time, 1e-3)
+            v_norm = float(np.linalg.norm(v_desired))
+            if v_norm > v_max:
+                v_desired = v_desired * (v_max / v_norm)
+            a_max = float(cfg["acc_max_train"])
+            dv = v_desired - vel
+            dv_norm = float(np.linalg.norm(dv))
+            if dv_norm > a_max * dt:
+                dv = dv * (a_max * dt / dv_norm)
+            vel = vel + dv
+            acc = dv / dt
+            pos = pos + vel * dt
+        else:
+            # Pass-2: Poly5Solver -- match the deployed test_yopo_ros.py
+            # path.  3 independent 5th-order polynomials (x, y, z),
+            # boundary conditions = (current state) -> (predicted endstate
+            # at +traj_time).  Step dt forward and read (p, v, a) at t=dt.
+            poly_x = Poly5Solver(pos[0], vel[0], acc[0],
+                                  target_pos[0], target_vel[0], target_acc[0],
+                                  traj_time)
+            poly_y = Poly5Solver(pos[1], vel[1], acc[1],
+                                  target_pos[1], target_vel[1], target_acc[1],
+                                  traj_time)
+            poly_z = Poly5Solver(pos[2], vel[2], acc[2],
+                                  target_pos[2], target_vel[2], target_acc[2],
+                                  traj_time)
+            pos = np.array([poly_x.get_position(dt),
+                             poly_y.get_position(dt),
+                             poly_z.get_position(dt)], dtype=np.float32)
+            vel = np.array([poly_x.get_velocity(dt),
+                             poly_y.get_velocity(dt),
+                             poly_z.get_velocity(dt)], dtype=np.float32)
+            acc = np.array([poly_x.get_acceleration(dt),
+                             poly_y.get_acceleration(dt),
+                             poly_z.get_acceleration(dt)], dtype=np.float32)
         # 7. update heading toward velocity (smoothed)
         speed = float(np.linalg.norm(vel))
         speeds.append(speed)
@@ -350,6 +383,11 @@ def main():
     ap.add_argument("--use-dca", action="store_true")
     ap.add_argument("--use-temporal", action="store_true")
     ap.add_argument("--max-scenarios", type=int, default=100)
+    ap.add_argument("--dynamics", choices=["point_mass", "poly5"],
+                    default="point_mass",
+                    help="closed-loop integrator: point_mass (Pass-1, fast SR "
+                         "upper bound) or poly5 (Pass-2, matches the deployed "
+                         "Poly5Solver in test_yopo_ros.py)")
     args = ap.parse_args()
 
     if not os.path.isabs(args.scenarios):
@@ -366,6 +404,7 @@ def main():
     print(f"   scenarios:    {len(sc_paths)}")
     print(f"   architecture: revae={args.use_revae} dca={args.use_dca} "
           f"temporal={args.use_temporal}")
+    print(f"   dynamics:     {args.dynamics}")
 
     rospy.init_node("stage5_closedloop", anonymous=True)
     bridge = SimBridge()
