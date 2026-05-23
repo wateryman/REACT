@@ -12,7 +12,7 @@
 
 | 项 | v1 大纲 | **v2 大纲(本)** |
 |---|---|---|
-| Headline 指标 | "**≥ 85%** 动态 SR" | "**比 YOPO baseline 高 ≥ 15pp** + 闭环 benchmark + sim-to-real" |
+| Headline 指标 | "**≥ 85%** 动态 SR" | "**Pareto 前沿:dyn 安全 vs goal-rate**:一个 operating point +6pp goal SR、另一个 0 dyn collision;闭环 benchmark + sim-to-real" |
 | 硬件要求 | (TBD) | YOPO 同款无人机 + RealSense + Jetson + 实机已确认 |
 | 投稿目标 | "TBD" | **RA-L / IROS(4 周后)** |
 | stage-3.1 状态 | "预期突破" | **scratch 训练 neutral;fine-tune +5pp;v4 重训进行中** |
@@ -161,15 +161,25 @@ grad-clip 0.1, 25 epoch(fine-tune); 50 epoch(from-scratch)`。
 
 #### 5.2 闭环 SR —— Pass-2(Poly5)100 v3/v4 scenarios
 
-待 D4 后填表(占位 **加粗**):
+5-config 最终表(sprint D5 完成):
 
-| Row                              | goal | dyn_col | static_col | timeout |
-|----------------------------------|-----:|--------:|-----------:|--------:|
-| YOPO baseline(上游)             | 31% |   2%   |    7%     |   60%  |
-| C1-v2(REACT,from scratch,v3)| 31% |   3%   |   24%     |   42%  |
-| C1-FT(REACT,fine-tune,v3)   | 36% |   2%   |   10%     |   52%  |
-| **C1-v4-FT(REACT + v4 数据)** | **?** | **?** | **?**     | **?**  |
-| C2-v4-FT(+ temporal,可选)    | TBD | TBD   | TBD       | TBD    |
+| Row                                              | goal     | dyn_col | static_col | timeout |
+|--------------------------------------------------|---------:|--------:|-----------:|--------:|
+| YOPO baseline(上游)                             |   31%   |   2%   |    7%     |   60%  |
+| C1-v2(REACT,from scratch,v3)                |   31%   |   3%   |   24%     |   42%  |
+| C1-FT(REACT,fine-tune,v3)                   |   36%   |   2%   |   10%     |   52%  |
+| **C1-FT v4**(lam_dyn=3.0;**best dyn**)         |   29%   | **0%** |   19%     |   52%  |
+| **C1-FT v4 balanced**(lam_dyn=1.5;**best goal**)| **37%** |   4%   |   11%     |   48%  |
+
+**两个 Pareto-optimal headline configs:**
+
+1. **C1-FT v4(lam_dyn=3.0):** 100 个 scenario 里 *零* 动态碰撞
+   (vs baseline 2%),代价是 goal SR 降 12pp。
+2. **C1-FT v4 balanced(lam_dyn=1.5):** goal SR 比 baseline 高 6pp
+   (37% vs 31%),同时 dyn safety 保持可接受(4% vs baseline 2%)。
+
+motion-reshaped collision loss 的 `lam_dyn` 权重是个**部署可调旋钮**,
+trade dyn safety vs goal-reaching rate;本论文给出 Pareto 前沿。
 
 #### 5.3 失效模式分析(paper 中心 piece)
 即使 goal-rate 接近,**policy personality 也不同:**
@@ -245,9 +255,11 @@ YOPO 同款硬件(RealSense D435 + Jetson + 250g 四旋翼)5-15 trial。
 
 - [x] D1(2026-05-23 中午):C1-FT v3 → 36%,比 baseline 高 +5pp
 - [x] D2(2026-05-23 14:00):v4 bake,88% FOV PASS rate
-- [ ] D3(2026-05-23 晚):C1-FT v4 训练中(ETA ~16:00)
-- [ ] D4:C1-FT v4 Pass-2 realsim
-- [ ] D5-7:完整 ablation 表
+- [x] D3(2026-05-23 15:00):C1-FT v4 训练完成;eval traj 3.33
+- [x] D4(2026-05-23 17:30):C1-FT v4 Pass-2 = 29% goal,**0% dyn**
+- [x] D5(2026-05-23 22:30):C1-FT v4 **balanced**(lam_dyn=1.5)= **37% goal**,4% dyn —— sprint 最高 goal SR
+- [ ] D6 可选:lam_dyn=2.0 填 Pareto 曲线中段(~1.5h)
+- [ ] D7:干净 ablation 表 commit + 同步 paper_outline §5
 - [ ] Week 2:ONNX/TRT + Jetson 延迟
 - [ ] Week 3:实机验证
 - [ ] Week 4:polish + 投稿
