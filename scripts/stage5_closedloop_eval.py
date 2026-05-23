@@ -195,7 +195,8 @@ class Planner:
         return d.reshape(1, 1, self.height, self.width)
 
     @torch.inference_mode()
-    def plan(self, depth_raw, pos, rot_wc, vel_w, acc_w, goal_w):
+    def plan(self, depth_raw, pos, rot_wc, vel_w, acc_w, goal_w,
+              anchor_filter: bool = True):
         depth = self._preprocess_depth(depth_raw)
         depth_t = torch.from_numpy(depth).to(self.device, non_blocking=True)
 
@@ -234,13 +235,16 @@ class Planner:
         # drone doesn't dive into the ground.  This is a deploy-side hack
         # to validate the architecture; the long-term fix is a z-floor
         # loss term in the trainer (stage-5.B plan B).
-        end_z_body = e[2].reshape(-1)       # (V*H,)
-        z_mask = end_z_body > -1.0
-        if z_mask.any():
-            s_masked = np.where(z_mask, s, np.inf)
-            best = int(np.argmin(s_masked))
+        if anchor_filter:
+            end_z_body = e[2].reshape(-1)       # (V*H,)
+            z_mask = end_z_body > -1.0
+            if z_mask.any():
+                s_masked = np.where(z_mask, s, np.inf)
+                best = int(np.argmin(s_masked))
+            else:
+                best = int(np.argmin(s))         # fallback if all below threshold
         else:
-            best = int(np.argmin(s))         # fall back if all anchors below threshold
+            best = int(np.argmin(s))
         v_idx, h_idx = best // Wh, best % Wh
         # Body-frame endstate fields: [px, py, pz, vx, vy, vz, ax, ay, az]
         end_pos_b = e[0:3, v_idx, h_idx]
@@ -316,7 +320,8 @@ def run_scenario(scenario, bridge, planner, args):
                     "min_clearance_m": min_clearance, "n_steps": step,
                     "mean_speed": float(np.mean(speeds)) if speeds else 0.0}
         # 4. plan
-        plan = planner.plan(depth, pos, rot_wc, vel, acc, goal)
+        plan = planner.plan(depth, pos, rot_wc, vel, acc, goal,
+                             anchor_filter=not args.no_anchor_filter)
         # 5. step drone state.  Two modes:
         target_pos = plan["end_pos_w"]
         target_vel = plan["end_vel_w"]
@@ -413,6 +418,12 @@ def main():
     ap.add_argument("--use-dca", action="store_true")
     ap.add_argument("--use-temporal", action="store_true")
     ap.add_argument("--max-scenarios", type=int, default=100)
+    ap.add_argument("--no-anchor-filter", action="store_true",
+                    help="disable the end_z > -1m anchor filter (Plan A hack).  "
+                         "With z_floor-trained models the filter is a no-op; with "
+                         "the baseline (untrained on z_floor) the filter clips "
+                         "look-down anchors and inflates baseline SR.  Use this "
+                         "flag for apples-to-apples comparison without the hack.")
     ap.add_argument("--dynamics", choices=["point_mass", "poly5"],
                     default="point_mass",
                     help="closed-loop integrator: point_mass (Pass-1, fast SR "
@@ -435,6 +446,7 @@ def main():
     print(f"   architecture: revae={args.use_revae} dca={args.use_dca} "
           f"temporal={args.use_temporal}")
     print(f"   dynamics:     {args.dynamics}")
+    print(f"   anchor_filter:{'OFF' if args.no_anchor_filter else 'ON (default)'}")
 
     rospy.init_node("stage5_closedloop", anonymous=True)
     bridge = SimBridge()
