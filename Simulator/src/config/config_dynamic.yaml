@@ -7,11 +7,11 @@
 
 # === REACT additions: bake mode + sequence params ===
 mode: "dynamic"                # 'static' (default) reuses original single-frame flow
-n_envs: 40                     # v3: doubled vs v2 (20); 4x v1 -- more env diversity
-n_seqs_per_env: 200            # v3: doubled vs v2 (100) -> 8000 seq total
+n_envs: 40                     # v4: same envs as v3
+n_seqs_per_env: 200            # v4: same 8000 seq total
 K: 10                          # frames per sequence
 dt: 0.0333                     # 30 Hz
-out_root: "../dataset_dynamic/v3"      # v3: stage-3.6 scale-up after stage-3.4 hit ~1% ceiling
+out_root: "../dataset_dynamic/v4"      # v4: stage-3.7 camera-aware ball spawn
 
 # Dynamic obstacle spawn parameters
 dyn_obs:
@@ -24,6 +24,16 @@ dyn_obs:
   bbox_xy_half: 15.0           # m, balls bounce inside [-bbox, bbox]^2 in xy
   bbox_z_lo: 0.5
   bbox_z_hi: 6.0
+  # 🟦 stage-3.7 v4: camera-aware spawn.  When spawn_in_front is true, balls
+  # are generated inside a forward cone of the drone's INITIAL pose instead
+  # of uniformly in the bbox.  Goal: raise FOV-presence rate from v3's ~22%
+  # (most frames have NO ball in image -> zero training signal for dyn loss)
+  # to ~50-60% so dyn-loss gets a real gradient.
+  spawn_in_front: true         # v4 production setting
+  fov_yaw_deg:   45.0          # +/- this from drone +X axis (azimuth half-width)
+  fov_pitch_deg: 30.0          # +/- this from drone +X axis (elevation half-width)
+  fov_dist_min:   3.0          # minimum drone-ball distance at spawn (m)
+  fov_dist_max:  12.0          # max drone-ball distance at spawn (m)
 
 # Drone trajectory: constant body-frame +X velocity for K frames
 drone_traj:
@@ -47,7 +57,7 @@ expand_x_times: 0
 expand_y_times: 0
 occupy_threshold: 0
 
-seed: 13                       # v3: different from v1 (7) and v2 (11) so envs are fresh
+seed: 17                       # v4: different from v1/2/3 (7/11/13) so envs are fresh
 x_length: 60
 y_length: 60
 z_length: 15

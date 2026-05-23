@@ -127,7 +127,9 @@ struct DynamicBall
 
 static std::vector<DynamicBall> spawn_balls(std::mt19937& rng, const YAML::Node& dcfg,
                                              const Eigen::Vector3f& bbox_lo,
-                                             const Eigen::Vector3f& bbox_hi)
+                                             const Eigen::Vector3f& bbox_hi,
+                                             const Eigen::Vector3f& drone_start_pos = Eigen::Vector3f::Zero(),
+                                             const Eigen::Quaternionf& drone_start_quat = Eigen::Quaternionf::Identity())
 {
     std::uniform_int_distribution<int> count_dist(dcfg["count_min"].as<int>(), dcfg["count_max"].as<int>());
     std::uniform_real_distribution<float> speed_dist(dcfg["speed_min"].as<float>(), dcfg["speed_max"].as<float>());
@@ -135,15 +137,50 @@ static std::vector<DynamicBall> spawn_balls(std::mt19937& rng, const YAML::Node&
     std::uniform_real_distribution<float> u01(0.0f, 1.0f);
     std::normal_distribution<float> normal01(0.0f, 1.0f);
 
+    // 🟦 stage-3.7 v4: camera-aware spawn. When spawn_in_front is true, balls are
+    // generated inside a forward cone of the drone's initial body frame instead
+    // of uniformly in the world bbox.  This raises the FOV-presence rate from
+    // the ~22 % observed in v3 to ~60 %, giving the model more dynamic-obstacle
+    // training signal per sequence.  See REACT_MATH_Derivations/01 §4 last
+    // bullet ("camera-aware ball spawn") for motivation.
+    bool spawn_in_front = dcfg["spawn_in_front"] ? dcfg["spawn_in_front"].as<bool>() : false;
+    float fov_yaw_deg   = dcfg["fov_yaw_deg"]   ? dcfg["fov_yaw_deg"].as<float>()   : 40.0f;
+    float fov_pitch_deg = dcfg["fov_pitch_deg"] ? dcfg["fov_pitch_deg"].as<float>() : 30.0f;
+    float fov_dist_min  = dcfg["fov_dist_min"]  ? dcfg["fov_dist_min"].as<float>()  : 3.0f;
+    float fov_dist_max  = dcfg["fov_dist_max"]  ? dcfg["fov_dist_max"].as<float>()  : 12.0f;
+    float fov_yaw_rad   = fov_yaw_deg   * static_cast<float>(M_PI) / 180.0f;
+    float fov_pitch_rad = fov_pitch_deg * static_cast<float>(M_PI) / 180.0f;
+
     int n = count_dist(rng);
     std::vector<DynamicBall> balls;
     balls.reserve(n);
     for (int i = 0; i < n; ++i)
     {
         DynamicBall b;
-        b.pos.x() = bbox_lo.x() + u01(rng) * (bbox_hi.x() - bbox_lo.x());
-        b.pos.y() = bbox_lo.y() + u01(rng) * (bbox_hi.y() - bbox_lo.y());
-        b.pos.z() = bbox_lo.z() + u01(rng) * (bbox_hi.z() - bbox_lo.z());
+        if (spawn_in_front)
+        {
+            // Sample (distance, yaw_offset, pitch_offset) in the camera-aware
+            // forward cone, then transform from body to world via drone_quat.
+            float d   = fov_dist_min + u01(rng) * (fov_dist_max - fov_dist_min);
+            float th  = (-1.0f + 2.0f * u01(rng)) * fov_yaw_rad   / 2.0f;
+            float phi = (-1.0f + 2.0f * u01(rng)) * fov_pitch_rad / 2.0f;
+            Eigen::Vector3f p_body(d * std::cos(phi) * std::cos(th),
+                                   d * std::cos(phi) * std::sin(th),
+                                   d * std::sin(phi));
+            Eigen::Vector3f p_world = drone_start_quat * p_body + drone_start_pos;
+            // Clamp to bbox so ball-step's bbox reflection stays sane.
+            p_world.x() = std::max(bbox_lo.x(), std::min(bbox_hi.x(), p_world.x()));
+            p_world.y() = std::max(bbox_lo.y(), std::min(bbox_hi.y(), p_world.y()));
+            p_world.z() = std::max(bbox_lo.z(), std::min(bbox_hi.z(), p_world.z()));
+            b.pos = p_world;
+        }
+        else
+        {
+            // Legacy v1/v2/v3 spawn: uniform in bbox.
+            b.pos.x() = bbox_lo.x() + u01(rng) * (bbox_hi.x() - bbox_lo.x());
+            b.pos.y() = bbox_lo.y() + u01(rng) * (bbox_hi.y() - bbox_lo.y());
+            b.pos.z() = bbox_lo.z() + u01(rng) * (bbox_hi.z() - bbox_lo.z());
+        }
         // Random direction: gaussian unit vector with vertical damping
         Eigen::Vector3f dir(normal01(rng), normal01(rng), 0.2f * normal01(rng));
         dir.normalize();
@@ -239,9 +276,12 @@ static bool generate_one_sequence(GridMap& grid_map, CameraParams& camera,
                              dcfg["bbox_xy_half"].as<float>(),
                              dcfg["bbox_z_hi"].as<float>());
 
-    auto balls = spawn_balls(rng, dcfg, bbox_lo, bbox_hi);
+    // 🟦 stage-3.7 v4: drone trajectory FIRST so camera-aware spawn knows
+    // the drone's initial pose.  Legacy (spawn_in_front=false) path is
+    // unaffected because spawn_balls ignores the drone_start args.
     auto traj  = sample_drone_traj_k_frames(rng, K, dt, tcfg, main_cfg, kdtree, safe_dist, quat_bc);
     if (traj.empty()) return false;
+    auto balls = spawn_balls(rng, dcfg, bbox_lo, bbox_hi, traj[0].pos, traj[0].quat_wc);
 
     fs::create_directories(seq_dir);
 
